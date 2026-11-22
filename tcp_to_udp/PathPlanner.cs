@@ -1,0 +1,4596 @@
+﻿using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Drawing.Design;
+using System.Drawing;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms.Design;
+using Emgu.CV;
+using Emgu.CV.CvEnum;
+using Emgu.CV.Structure;
+using Emgu.CV.UI;
+using Emgu.CV.Util;
+using System.Reflection;
+using Windows.ApplicationModel.Chat;
+
+namespace tcp_to_udp
+{
+    public class LinePath
+    {
+        public enum LineType { Main, Other }
+
+        public LineType type = LineType.Main;
+
+        public List<Point3d_GL> ps;
+        public void add(Point3d_GL p)  { ps = Point3d_GL.add_arr(ps, p); }
+        public void rotate(double angle)  {  ps = Point3d_GL.rotate_points(ps, angle);  }
+        public void reverse_dotted()//for dotted color
+        {
+            var ps_rev = new List<Point3d_GL>();
+            for (int i = 0; i < ps.Count-2; i+=2)
+            {
+                var p1 = ps[ps.Count - 1 - i];
+                var p2 = ps[ps.Count - 2 - i];
+                p1.color = ps[ps.Count - 2 - i].color;
+                p2.color = ps[ps.Count - 1 - i].color;
+                ps_rev.Add(p1); ps_rev.Add(p2);
+            }
+            ps = ps_rev;
+        }
+        public void reverse()
+        {
+            ps.Reverse();
+        }
+        public Point3d_GL get_first()
+        {
+            if (ps == null) return Point3d_GL.notExistP();
+            if (ps.Count < 1) return Point3d_GL.notExistP();
+            return ps[0];
+        }
+
+        public Point3d_GL get_last()
+        {
+            if (ps == null) return Point3d_GL.notExistP();
+            if (ps.Count < 2) return Point3d_GL.notExistP();
+            return ps[ps.Count-1];
+        }
+
+        public double dist()
+        {
+            var ps_f = get_first();
+            var ps_l = get_last();
+            if(ps_f.exist && ps_l.exist)
+            {
+                return (ps_f - ps_l).magnitude();
+            }
+            return -1;
+        }
+
+        static public int nearest_end_line(LinePath[] lines, LinePath line)
+        {
+            var min_d = double.MaxValue;
+            var i_min = 0;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                double dist;
+                int j;
+                (j,dist) = min_dist_ends(lines[i],line);
+                if (dist < min_d)
+                {
+                    min_d = dist;
+                    i_min = i;
+                }
+            }
+            return i_min;
+        }
+
+        static public (int,double) min_dist_ends(LinePath line1, LinePath line2)
+        {
+            if (line1.ps == null || line2.ps == null) return (0,double.NaN);
+            if (line1.ps.Count < 2 || line2.ps.Count < 2) return (0, double.NaN);
+            var p1 = line1.ps[0];
+            var p2 = line1.ps[line1.ps.Count - 1];
+            var p3 = line2.ps[0];
+            var p4 = line2.ps[line2.ps.Count - 1];
+            var d1 = (p1 - p3).magnitude();
+            var d2 = (p1 - p4).magnitude();
+            var d3 = (p2 - p3).magnitude();
+            var d4 = (p2 - p4).magnitude();
+
+            var dists = new double[] { d1, d2, d3, d4 };
+            var min_d = double.MaxValue;
+            var i_min = 0;
+            for (int i = 0; i < dists.Length; i++)
+            {
+                if (dists[i] < min_d)
+                {
+                    min_d = dists[i];
+                    i_min = i;
+                }
+            }
+            return (i_min,min_d);
+        }
+
+        static public (LinePath, LinePath,bool) try_connect_lines(LinePath line1, LinePath line2,double min_dist)
+        {
+            double min_d;
+            int i_min;
+            (i_min, min_d) = min_dist_ends(line1, line2);
+            if (min_d > min_dist) return (line1, line2, false);
+            switch(i_min)
+            {
+                case 0: line1.reverse(); break;
+                case 1: line1.reverse(); line2.reverse(); break;
+                case 2: break;
+                case 3: line2.reverse(); break;
+            }
+
+            return (line1, line2, true);
+        }
+
+        static public (LayerPath, LinePath, bool) try_connect_lines(LayerPath layer, LinePath line, double min_dist)
+        {
+            double d1, d2;
+            int i1, i2;
+            (i1,d1) = min_dist_ends(layer.lines[0], line);
+            (i2, d2) = min_dist_ends(layer.lines[layer.lines.Count-1], line);
+            var min_d = Math.Min(d1, d2);
+            bool ret = false;
+            if(d1 < d2)
+            {
+                switch (i1)
+                {
+                    case 0: layer.lines.Reverse(); line.reverse(); break;//!!!!!!!
+                    case 1: layer.lines.Reverse(); break;//!!!!!!!
+                    case 2: layer.lines.Reverse(); break;//!!!!!!!
+                    case 3: layer.lines.Reverse(); line.reverse(); break;//!!!!!!!
+                }
+            }
+            else
+            {
+                switch (i2)
+                {
+                    case 0: line.reverse(); break;
+                    case 1:  break;
+                    case 2:  break;
+                    case 3:  line.reverse(); break;
+                }
+            }
+            if (min_d < min_dist) ret = true;
+            return (layer, line, ret);
+        }
+
+        public LinePath Clone()
+        {
+            var ps_cl = ((Point3d_GL[])ps.ToArray().Clone()).ToList();
+            return new LinePath() { ps = ps_cl};
+        }
+
+        public LinePath divide_traj(double div_step)
+        {
+            var traj_div = new List<Point3d_GL>();
+            for (int i = 0; i < ps.Count - 1; i++)
+            {
+                traj_div.Add(ps[i]);
+                var dist = (ps[i + 1] - ps[i]).magnitude();
+                if (2 * dist > div_step)
+                {
+                    var n = (int)(dist / div_step);
+                    for (int j = 0; j < n; j++)
+                    {
+                        traj_div.Add(
+                            new Point3d_GL(
+                            ps[i].x + (div_step * j * (ps[i + 1].x - ps[i].x)) / dist,
+                            ps[i].y + (div_step * j * (ps[i + 1].y - ps[i].y)) / dist,
+                            ps[i].z + (div_step * j * (ps[i + 1].z - ps[i].z)) / dist
+                            ));
+                    }
+                }
+            }
+            ps =((Point3d_GL[]) traj_div.ToArray().Clone()).ToList();
+            return this;
+        }
+
+        public LinePath filter_traj(double min_dist)
+        {
+            var traj_filt = new List<Point3d_GL>();
+            if (ps.Count < 1) return this;
+            traj_filt.Add(ps[0].Clone());
+            if (ps.Count < 2) return this;
+            for (int i = 1; i < ps.Count - 1; i++)
+            {
+                if((ps[i]-traj_filt[traj_filt.Count-1]).magnitude() > min_dist)
+                    traj_filt.Add(ps[i]);
+            }
+            ps = ((Point3d_GL[])traj_filt.ToArray().Clone()).ToList();
+            return this;
+        }
+
+        public LinePath translate(Point3d_GL p)
+        {
+            for(int i = 0; i < this.ps.Count;i++)
+            {
+                ps[i] += p;
+            }
+            return this;
+        }
+
+    }
+    public class LayerPath
+    {
+        public List<LinePath> lines;
+        public LayerPath() {
+            lines = new List<LinePath>();
+        }
+        public LayerPath(TrajectoryPath traj)
+        {
+            var ls = new List<LinePath>();
+            foreach(var layer in traj.layers)
+            {
+                ls.AddRange(layer.lines);
+            }
+            lines = ls;
+        }
+        public void ReverseLines()
+        {
+            for(int i = 0; i < lines.Count; i++)
+                lines[i].reverse();
+        }
+        public Point3d_GL getPoint(int ind)
+        {
+            switch (ind)
+            {
+                case -2:
+                    return lines[lines.Count - 1].ps[0];
+                case -1:
+                    return lines[lines.Count - 1].ps[lines[lines.Count - 1].ps.Count - 1];
+                case 0:
+                    return lines[0].ps[0];
+                case 1:
+                    return lines[0].ps[lines[0].ps.Count-1];
+                default:
+                    return Point3d_GL.notExistP();
+            }
+        }
+        public void add(Point3d_GL p)
+        {
+            foreach(LinePath l in lines)
+                l.add(p);
+        }
+
+        public LayerPath translate(Point3d_GL p)
+        {
+            foreach (var l in lines)
+                l.translate(p);
+            return this;
+        }
+        public void rotate(double angle)
+        {
+            foreach (LinePath l in lines)
+                l.rotate(angle);
+        }
+
+        public List<Point3d_GL> to_ps()
+        {
+            var ps = new List<Point3d_GL>();
+            foreach (var line in lines)
+                ps.AddRange(line.ps);
+            return ps;
+        }
+
+        public List<List<Point3d_GL>> to_ps_by_lines()
+        {
+            var ps = new List<List<Point3d_GL>>();
+            foreach (var line in lines)
+                ps.Add(line.ps);
+            return ps;
+        }
+        public List<List<Point3d_GL>> to_ps_by_lines_main_only()
+        {
+            var ps = new List<List<Point3d_GL>>();
+            foreach (var line in lines)
+            {
+                if(line.type == LinePath.LineType.Main) { ps.Add(line.ps); }
+            }    
+            return ps;
+        }
+        public LayerPath Clone()
+        {
+            var layers_cl = new List<LinePath>();
+            foreach (var line in lines)
+                layers_cl.Add(line.Clone());
+            return new LayerPath() { lines = layers_cl };
+        }
+        public LayerPath divide_traj(double div)
+        {
+            var layers_cl = new List<LinePath>();
+            foreach (var line in lines)
+                layers_cl.Add(line.divide_traj(div));
+            return new LayerPath() { lines = layers_cl };
+        }
+
+        public LayerPath filter_traj(double div)
+        {
+            var layers_cl = new List<LinePath>();
+            foreach (var line in lines)
+                layers_cl.Add(line.filter_traj(div));
+            return new LayerPath() { lines = layers_cl };
+        }
+
+        public LayerPath fill_gaps(double div)
+        {
+            var lines_old = ((LinePath[])lines.ToArray().Clone()).ToList();
+            lines = new List<LinePath>();
+            lines.Add(lines_old[0].Clone());
+            for (int i=1; i < lines_old.Count; i++)
+            {
+                var fill = new Point3d_GL[] { lines_old[i - 1].get_last(), lines_old[i].get_first() };
+                var ps =  PathPlanner.divide_traj(fill.ToList(), div,true);
+                var gap = new LinePath() { ps = ps };
+                gap.type = LinePath.LineType.Other;
+                lines.Add(gap);
+                lines.Add(lines_old[i].Clone());
+            }
+            return this;
+        }
+
+    }
+    public class TrajectoryPath
+    {
+        public List<LayerPath> layers;
+        public void add(Point3d_GL p)
+        {
+            foreach (var l in layers)
+                l.add(p);
+        }
+        public void rotate(double angle)
+        {
+            foreach (var l in layers)
+                l.rotate(angle);
+        }
+        public List<Point3d_GL> to_ps()
+        {
+            var ps = new List<Point3d_GL>();
+            foreach (var layer in layers)
+                foreach (var line in layer.lines)
+                    ps.AddRange(line.ps);
+            return ps;
+        }
+
+        public List<List<Point3d_GL>> to_ps_by_layers()
+        {
+            var ps_list = new List<List<Point3d_GL>>();
+            var ps = new List<Point3d_GL>();
+
+            foreach (var layer in layers)
+            {
+                ps = new List<Point3d_GL>();
+                foreach (var line in layer.lines)
+                {
+                    ps.AddRange(line.ps);
+                }
+                ps_list = ps_list.Append(ps).ToList();
+            }
+               
+            return ps_list;
+        }
+        public TrajectoryPath Clone()
+        {
+            var layers_cl = new List<LayerPath>();
+            foreach (var layer in layers)
+                layers_cl.Add(layer.Clone());
+            return new TrajectoryPath() { layers = layers_cl };
+        }
+        public TrajectoryPath translate(Point3d_GL p)
+        {
+            foreach (var l in layers)
+                l.translate(p);
+            return this;
+        }
+        public TrajectoryPath fill_gaps(double div)
+        {
+            foreach (var l in layers)
+                l.fill_gaps(div);
+            return this;
+        }
+
+        public TrajectoryPath gauss(int w)
+        {
+            var ps = to_ps(); //Console.WriteLine("ps.Count: "+ps.Count);
+            var ps_gauss = Point3d_GL.line_aver(ps.ToArray(), w);
+            int c = 0;
+            for (int i = 0; i < layers.Count; i++)
+            {
+                for (int j = 0; j <layers[i].lines.Count; j++)
+                {
+                    for (int k = 0; k < layers[i].lines[j].ps.Count; k++)
+                    {
+
+                        layers[i].lines[j].ps[k] = ps_gauss[c]; c++;
+                    }
+                }
+            }
+            //Console.WriteLine("ps.Count: " + to_ps().Count);
+            return this;
+        }
+
+    }
+    public class PathPlanner
+    {
+
+
+
+
+        public enum PatternType { Lines, Harmonic,Dotted}
+        static double pi = 3.1415926535;
+        static double cos(double ang)
+        {
+            return Math.Cos(ang);
+        }
+        static double sin(double ang)
+        {
+            return Math.Sin(ang);
+        }
+        public static LinePath gen_arc_sect_xy(Point3d_GL p1, Point3d_GL p2, double r, double min_dist, bool right = true)
+        {
+            var v1 = p2 - p1;
+            if (v1.magnitude() > 2 * r) return new LinePath { ps = new List<Point3d_GL>(new Point3d_GL[] { p1, p2 }) };
+            var v2 = v1 / 2;
+            var v3_len = Math.Sqrt(r * r - (v2.magnitude() * v2.magnitude()));
+            var v3 = Point3d_GL.vec_perpend_xy(v2).normalize()* v3_len;
+            double sign = 1;
+            if(right) sign = -1;
+            var p3 = p1 + v2 + v3 * sign;
+            var v_beg = p1 - p3;
+            var v_end = p2 - p3;
+            var ps = new List<Point3d_GL>();
+            var alph = Point3d_GL.ang(v_beg, v_end);
+            var min_alph = min_dist / r;
+            var delim = (int)(alph/min_alph);
+            ps.Add(p1);
+            var v_beg_n = v_beg.normalize();
+            var v_end_n = v_end.normalize();
+            for (int i = 1; i < delim; i++)
+            {
+                var fi = (i/(double)delim)* (pi / 2);
+                var v_med = (v_beg_n * cos(fi) + v_end_n * sin(fi)).normalize() *r ;
+                ps.Add(p3+v_med);
+            }
+            ps.Add(p2);
+            return new LinePath { ps = ps};
+        }
+
+        public static LinePath gen_smooth_arc(Point3d_GL[] ps, double r, double min_dist)
+        {
+            var ps_sm = new List<Point3d_GL>();
+            ps_sm.Add(ps[0]);
+            for (int i = 1; i < ps.Length-1; i++)
+            {
+                ps_sm.AddRange(gen_arc_sect(ps[i-1], ps[i], ps[i + 1],r,min_dist).ps);
+            }
+            ps_sm.Add(ps[ps.Length-1]);
+            return new LinePath { ps = ps_sm };
+        }
+
+        public static List<RobotFrame> gen_smooth_arc(List<RobotFrame> ps, double r, double min_dist)
+        {
+            var ps_sm = new List<RobotFrame>();
+            ps_sm.Add(ps[0]);
+            for (int i = 1; i < ps.Count - 1; i++)
+            {
+                var ps_sec = gen_arc_sect(ps[i - 1].get_pos(), ps[i].get_pos(), ps[i + 1].get_pos(), r, min_dist).ps;
+                for (int j = 0; j < ps_sec.Count; j++)
+                {
+                    var fr = ps[i].Clone();
+                    fr.set_pos(ps_sec[j]);
+                    ps_sm.Add(fr);
+                }
+            }
+            ps_sm.Add(ps[ps.Count - 1]);
+            return ps_sm;
+        }
+        public static List<Point3d_GL> gen_smooth_arc(List<Point3d_GL> ps, double r, double min_dist)
+        {
+            var ps_sm = new List<Point3d_GL>();
+            ps_sm.Add(ps[0]);
+            for (int i = 1; i < ps.Count - 1; i++)
+            {
+                var ps_sec = gen_arc_sect(ps[i - 1], ps[i], ps[i + 1], r, min_dist).ps;
+                for (int j = 0; j < ps_sec.Count; j++)
+                {
+                    var fr = ps[i].Clone();
+                    ps_sm.Add(ps_sec[j]);
+                }
+            }
+            ps_sm.Add(ps[ps.Count - 1]);
+            return ps_sm;
+        }
+        public static LinePath gen_arc_sect(Point3d_GL p1, Point3d_GL p2, Point3d_GL p3, double r, double min_dist)
+        {
+            var v1 = p1 - p2;
+            var v2 = p3 - p2;
+            if (v1.magnitude() < 2 * r || v2.magnitude() < 2 * r) return new LinePath { ps = new List<Point3d_GL>(new Point3d_GL[] { p2 }) };
+            var v1_n = v1.normalize();
+            var v2_n = v2.normalize();
+            var vc_n = ((v1_n+v2_n)/2).normalize();
+            var alpha  = Point3d_GL.ang(v1_n, v2_n)/2;
+            var d1 = r / Math.Sin(alpha);
+            var d2 = r / Math.Tan(alpha);
+            var p3_c = p2 + vc_n * d1;
+            var p1_c = p2 + v1 * d2;
+            var p2_c = p2 + v2 * d2;
+            //----------------------------------
+            var v_beg = p1_c - p3_c;
+            var v_end = p2_c - p3_c;
+            var ps = new List<Point3d_GL>();
+            var alph = Point3d_GL.ang(v_beg, v_end);
+            var min_alph = min_dist / r;
+            var delim = (int)(alph / min_alph);
+            ps.Add(p1_c);
+            var v_beg_n = v_beg.normalize();
+            var v_end_n = v_end.normalize();
+            for (int i = 1; i < delim; i++)
+            {
+                var fi = (i / (double)delim) * (pi / 2);
+                var v_med = (v_beg_n * cos(fi) + v_end_n * sin(fi)).normalize() * r;
+                ps.Add(p3_c + v_med);
+            }
+            ps.Add(p2_c);
+            return new LinePath { ps = ps };
+        }
+
+        public static LinePath gen_harmonic_line_xy(Point3d_GL p1, Point3d_GL p2, double r, double min_dist, double dist_arc, bool start_dir_is_right = true)
+        {
+            var ps = new List<Point3d_GL>();
+            var dist = (p2 - p1).magnitude();
+            var len_arc = (int)(dist / dist_arc);
+            var p = p1.Clone();
+            var pv = (p2 - p1).normalize() * dist_arc;
+            bool dir = start_dir_is_right;
+            for(int i=0; i<len_arc;i++)
+            {
+                ps.AddRange(gen_arc_sect_xy(p, p + pv, r, min_dist, dir).ps);
+                p += pv;
+                dir = !dir;
+            }
+            return new LinePath { ps = ps };
+        }
+
+        public static LinePath gen_dotted_line_xy(Point3d_GL p1, Point3d_GL p2, double step, double filling)
+        {
+            var ps = new List<Point3d_GL>();
+            var dist = (p2 - p1).magnitude();
+            var len_arc = (int)(dist / step);
+            var p = p1.Clone();
+            var pvn = (p2 - p1).normalize();
+            var pv = pvn * step;
+            var len_dot_2 = step * filling / 2;
+            for (int i = 0; i <= len_arc; i++)
+            {
+                var p_a = p - pvn * len_dot_2;
+                p_a.color = new Color3d_GL(1, 0, 0);
+                var p_b = p + pvn * len_dot_2;
+                p_b.color = new Color3d_GL(0, 0, 0);
+                ps.Add(p_a); ps.Add(p_b);
+                p += pv;
+            }
+            return new LinePath { ps = ps };
+        }
+
+
+        public static List<Point3d_GL> matr_to_traj(List<Matrix<double>> matrs)
+        {
+            if(matrs == null) return null;
+            var traj_m = new List<Point3d_GL>();
+            for (int i = 0; i < matrs.Count; i++)
+            {
+                traj_m.Add(new Point3d_GL(matrs[i][0, 3], matrs[i][1, 3], matrs[i][2, 3]));
+            }
+            return traj_m;
+        }
+        static public  List<Point3d_GL> join_traj(List<List<Point3d_GL>> traj)
+        {
+            var traj_j = new List<Point3d_GL>();
+            for(int i=0; i<traj.Count;i++)
+            {
+                traj_j.AddRange(traj[i]);
+            }
+            return traj_j;
+        }
+
+        public static List<Matrix<double>> join_traj(List<List<Matrix<double>>> traj)
+        {
+            if (traj == null) return null;
+            var traj_j = new List<Matrix<double>>();
+            for (int i = 0; i < traj.Count; i++)
+            {
+                traj_j.AddRange(traj[i]);
+            }
+            return traj_j;
+        }
+
+        static List<Point3d_GL> join_traj_matr(List<List<Matrix<double>>> traj)
+        {
+            var traj_j = new List<Point3d_GL>();
+            for (int i = 0; i < traj.Count; i++)
+            {
+                traj_j.AddRange(matr_to_traj(traj[i]));
+            }
+            return traj_j;
+        }
+        public static List<Point3d_GL> test2dcont(double rad,int amount,double dz)
+        {
+            List<List<Point3d_GL>> conts = new List<List<Point3d_GL>>();
+            List<double> zs = new List<double>();
+            for (int i =0; i<amount; i++)
+            {
+                conts.Add(GenerateContour(20, rad, rad * 0.2));
+                zs.Add(dz * i);
+            }
+            var param_tr = new TrajParams
+            {
+                div_step = 0.3,
+                h_transf = 3,
+                layers = amount,
+                layers_angle = Math.PI / 2,
+                step = rad / 10,
+                z = zs.ToArray()
+            };
+            var traj = Generate_multiLayer2d_mesh(conts, param_tr);
+
+            return join_traj(traj);
+        }
+
+        public static List<Point3d_GL> test2dcont(List<Point3d_GL> cont, int amount, double dz)
+        {
+            List<List<Point3d_GL>> conts = new List<List<Point3d_GL>>();
+            List<double> zs = new List<double>();
+            for (int i = 0; i < amount; i++)
+            {
+                conts.Add(cont);
+                zs.Add(dz * i);
+            }
+            var param_tr = new TrajParams
+            {
+                div_step = 0.3,
+                h_transf = 3,
+                layers = amount,
+                layers_angle = Math.PI / 2,
+                step = dz*3,
+                z = zs.ToArray()
+            };
+            var traj = Generate_multiLayer2d_mesh(conts, param_tr);
+
+            return join_traj(traj);
+        }
+
+        public static List<Matrix<double>> test3dcont(Polygon3d_GL[] surface, List<Point3d_GL> cont, int amount, double dz)
+        {
+            List<List<Point3d_GL>> conts = new List<List<Point3d_GL>>();
+            List<double> zs = new List<double>();
+            for (int i = 0; i < amount; i++)
+            {
+                conts.Add(cont);
+                zs.Add(dz * (i+1));
+            }
+            var param_tr = new TrajParams
+            {
+                div_step = 1.3,
+                h_transf = 3,
+                layers = amount,
+                layers_angle = Math.PI / 2,
+                step = dz * 4,
+                z = zs.ToArray()
+            };
+            var traj = Generate_multiLayer3d_mesh(surface,conts, param_tr);
+
+            return join_traj(traj);
+        }
+
+
+        static List<Point3d_GL> GenerateContour(int n, double rad, double delt)
+        {
+            double step = 2 * Math.PI/n;
+            var cont = new List<Point3d_GL>();
+            Random rand = new Random();
+            for(int i=0; i<=n; i++)
+            {
+                var l = rad + delt * rand.NextDouble();
+                var x = l * Math.Cos(i * step);
+                var y = l * Math.Sin(i * step);
+                cont.Add(new Point3d_GL(x, y, 0));
+            }
+            return cont;
+        }
+
+        static List<Point3d_GL> FindCross_for_line(List<Point3d_GL> p, double y)
+        {
+            var x = p[0].x + (p[1].x - p[0].x) * (y - p[0].y) / (p[1].y - p[0].y);
+            var p1 =new  Point3d_GL(x, y, 0);
+            x = p[2].x + (p[3].x - p[2].x) * (y - p[2].y) / (p[3].y - p[2].y);
+            var p2 = new Point3d_GL(x, y, 0);
+
+            var ps = new List<Point3d_GL>();
+            ps.Add(p1); ps.Add(p2);
+            return ps;
+        }
+        static List<Point3d_GL> FindPoints_for_line(List<Point3d_GL> contour, double y)
+        {
+            var ps = new List<Point3d_GL>();
+            for (int i = 1; i < contour.Count; i++)
+            {
+                if(((y>=contour[i].y) && (y < contour[i-1].y)) || ((y >= contour[i-1].y) && (y < contour[i].y)))
+                {
+                    ps.Add(contour[i - 1]);
+                    ps.Add(contour[i]);
+                }
+            }
+            if(ps.Count>3)
+            {
+                if (ps[0].x < ps[2].x)
+                {
+                    return ps;
+                }
+                else
+                {
+                    var ps_r = new List<Point3d_GL>();
+                    ps_r.Add(ps[2]);
+                    ps_r.Add(ps[3]);
+                    ps_r.Add(ps[0]);
+                    ps_r.Add(ps[1]);
+                    return ps_r;
+                }
+            }
+            return new List<Point3d_GL>();
+        }
+
+
+        public static LayerPath gen_pattern_in_square_xy(PatternSettings settings,Point3d_GL p_min, Point3d_GL p_max)
+        {
+            if (settings == null) return null;
+            var pattern = new List<LinePath>();
+            var p_cent = new Point3d_GL(p_min, p_max);
+            p_min = p_cent + (p_min - p_cent) * 1;
+            p_max = p_cent + (p_max - p_cent) * 1;
+            switch (settings.patternType)
+            {
+                case PatternType.Lines:
+                    {
+                        bool dir = false;
+                        for (double y = p_min.y; y <= p_max.y;y+=settings.step)
+                        {
+                            var p1 = new Point3d_GL(p_min.x, y);
+                            var p2 = new Point3d_GL(p_max.x, y);
+                            var line = new LinePath { ps = new List<Point3d_GL>(new Point3d_GL[] { p1, p2 }) };
+                            if (dir) line.ps.Reverse();
+                            dir = !dir;
+                            pattern.Add(line);
+                        }
+                    }
+                    break;
+                case PatternType.Harmonic:
+                    {
+                        bool dir_r = settings.start_dir_r;
+                        bool dir = false;
+                        for (double y = p_min.y; y <= p_max.y; y += settings.step)
+                        {
+                            var p1 = new Point3d_GL(p_min.x, y);
+                            var p2 = new Point3d_GL(p_max.x, y);
+                            var line = gen_harmonic_line_xy(p1, p2, settings.r, settings.min_dist, settings.arc_dist, dir_r);
+                            if (dir) line.ps.Reverse();
+                            dir_r = !dir_r;
+                            dir = !dir;
+                            pattern.Add(line);
+                        }
+                    }
+                    break;
+                case PatternType.Dotted:
+                    {
+                        bool dir = false;
+
+                        for (double y = p_min.y + settings.step/2; y <= p_max.y; y += settings.step)
+                        {
+                            var p1 = new Point3d_GL(p_min.x, y);
+                            var p2 = new Point3d_GL(p_max.x, y);
+                            var line = gen_dotted_line_xy(p1, p2, settings.step,settings.filling);
+                            if (dir) line.reverse();
+                            dir = !dir;
+                            pattern.Add(line);
+                        }
+                    }
+                    break;
+                default: break;
+            }
+            var layer = new LayerPath { lines = pattern };
+            p_cent.z = 0;
+            layer.add(-p_cent);
+            layer.rotate(settings.angle);
+
+            layer.add(p_cent);
+            return layer;
+        }
+
+        public static LayerPath gen_pattern_in_contour_xy(PatternSettings settings, TrajParams trajParams, List<Point3d_GL> contour, Point3d_GL p_min, Point3d_GL p_max)
+        {
+            var layer_sq = gen_pattern_in_square_xy(settings, p_min, p_max);
+            //Console.WriteLine("layer_sq z"+layer_sq[0].z + " " + layer_sq[1].z + " ");
+            //gl.addLineMeshTraj(layer_sq.to_ps().ToArray(), Color3d_GL.red());
+
+            // var ps_div = divide_traj(layer_sq, trajParams.div_step);
+            var ps_div = layer_sq.divide_traj(settings.min_dist).to_ps();
+
+            var cont_layer = cut_pattern_in_contour_xy_cv(contour, ps_div);
+           // gl.addLineMeshTraj(cont_layer.ToArray(), Color3d_GL.red());
+            var layer = parse_layerpath_from_ps(cont_layer, settings.min_dist, settings.step);//step
+            //gl.addLineMeshTraj(layer.to_ps().ToArray(), Color3d_GL.random());
+            return layer;
+        }
+
+
+        public static LayerPath parse_layerpath_from_ps(List<Point3d_GL> ps, double div, double step)
+        {
+            var lines = parse_linepath_from_ps(ps, div,step);
+            if(lines == null) return null;
+            if (lines.Length == 0) return null;
+            var areas = layerpaths_from_linepaths(lines, step);
+            /*foreach (var ls in areas)
+            {
+                var color = Color3d_GL.random();
+                foreach (var line in ls.lines)
+                {
+                    
+                    gl.addLineMeshTraj(line.ps.ToArray(), color, "lines");
+                    gl.addPointMesh(new Point3d_GL[] { line.ps[0], line.ps[line.ps.Count - 1] }, color, "ps");
+                }
+            }*/
+                
+            var traj = new TrajectoryPath{ layers = areas.ToList()};
+
+            traj = Trajectory.OptimizeTranzitions2LayerPath(traj);
+            return new LayerPath(traj);
+        }
+        
+
+        public static LayerPath[] layerpaths_from_linepaths(LinePath[] ls, double step)//!!!!!!
+        {
+            var ls_unioned = new List<LayerPath>();
+            var ls_list = ls.ToList();
+            ls_unioned.Add(new LayerPath());
+            ls_unioned[ls_unioned.Count - 1].lines.Add(ls[0]);
+            ls_list.RemoveAt(0);
+            for (; ls_list.Count > 0;)
+            {
+                var i_min = LinePath.nearest_end_line(ls_list.ToArray(), ls_unioned[ls_unioned.Count - 1].lines[ls_unioned[ls_unioned.Count - 1].lines.Count - 1]);
+                LinePath line1, line2;
+                LayerPath layerPath;
+                bool ret;
+                (layerPath, line2, ret) = LinePath.try_connect_lines(ls_unioned[ls_unioned.Count - 1], ls_list[i_min], step * 5);
+                if (ret)
+                {
+                    ls_unioned[ls_unioned.Count - 1] = layerPath;
+                    ls_unioned[ls_unioned.Count - 1].lines.Add(line2);
+                }
+                else
+                {
+                    ls_unioned.Add(new LayerPath());
+                    ls_unioned[ls_unioned.Count - 1].lines.Add(line2);
+                }
+                ls_list.RemoveAt(i_min);
+            }
+            return ls_unioned.ToArray();
+        }
+        public static LinePath[] parse_linepath_from_ps(List<Point3d_GL> ps, double div, double step)
+        {
+
+            var dirty_ls = parse_linepath_from_ps_dirty(ps, div);
+            if(dirty_ls == null) return null;
+            if (dirty_ls.Length == 0) return null;
+            dirty_ls = filter_linepath_dist(dirty_ls,step);
+            
+            var ls = linepath_from_dirty_linepath(dirty_ls, div);
+            /*foreach (var line in ls)
+            {
+                var color = Color3d_GL.random();
+                gl.addLineMeshTraj(line.ps.ToArray(), color, "lines");
+                gl.addPointMesh(new Point3d_GL[] { line.ps[0], line.ps[line.ps.Count-1] }, color, "ps");
+            }*/
+            return ls;
+        }
+        public static LinePath[] filter_linepath_dist(LinePath[] lps, double dist)
+        {
+            var lps_fil = new List<LinePath>();
+            foreach (var line in lps)
+            {
+                if(line.dist()>dist) lps_fil.Add(line);
+            }
+            return lps_fil.ToArray();
+        }
+        public static LinePath[] parse_linepath_from_ps_dirty(List<Point3d_GL> ps, double div)
+        {
+            //var ps_ord = Point3d_GL.order_points_by_dist(ps.ToArray(),div*1.3).ToList();
+            //var ps_ord = Point3d_GL.order_points(ps.ToArray()).ToList();
+            if(ps==null) return null;
+            if(ps.Count==0) return null;
+            var ps_ord = ps;
+            //gl.addLineMeshTraj(ps.ToArray(), Color3d_GL.yellow(), "lines");
+            //gl.addLineMeshTraj(ps_ord.ToArray(), Color3d_GL.aqua(), "lines2");
+            //gl.addPointMesh(new Point3d_GL[] { ps_ord[0], ps_ord[1] },Color3d_GL.black(), "ps");
+            var lines = new List<LinePath>();
+            var ps_loc = new List<Point3d_GL>();
+            ps_loc.Add(ps_ord[0]);
+            for (int i = 1; i < ps_ord.Count; i++)
+            {                
+                var dist =  (ps_ord[i] - ps_loc[ps_loc.Count-1]).magnitude();
+                if(dist>1.3*div)
+                {
+                    lines.Add(new LinePath() { ps = ps_loc });
+                    ps_loc = new List<Point3d_GL>();
+                    ps_loc.Add(ps_ord[i]);
+                    
+                }
+                else
+                {
+                    ps_loc.Add(ps_ord[i]);
+                }
+            }
+            if(ps_loc.Count>0) lines.Add(new LinePath() { ps = ps_loc });
+            return lines.ToArray();
+        }
+
+
+        public static LinePath[] linepath_from_dirty_linepath(LinePath[] ls, double div)//!!!
+        {
+            var ls_unioned = new List<LinePath>();
+
+            ls_unioned.Add(ls[0]);
+            for (int i = 0; i < ls.Length; i++)
+            {
+                LinePath line1, line2;
+                bool ret;
+                (line1, line2, ret) = LinePath.try_connect_lines(ls_unioned[ls_unioned.Count - 1], ls[i], div);
+                if(ret)
+                {
+                    ls_unioned.RemoveAt(ls_unioned.Count - 1);
+                    line1.ps.AddRange(line2.ps);
+                    ls_unioned.Add(line1);
+                }
+                else
+                {
+                    if (line1 == null) continue;
+                    ls_unioned.Add(line2);
+                }
+            }
+            return ls_unioned.ToArray();
+        }
+
+        public static int find_ind_first_linepath(LinePath[] ls)
+        {
+            int i_max = 0;
+            double dist_max = 0;
+            for (int i = 0; i < ls.Length; i++)
+            {
+                var dist = ls[i].dist();
+                if(dist > dist_max)
+                {
+                    i_max = i;
+                    dist_max = dist;
+                }
+            }
+            var sin_alpha = (ls[i_max].get_last().y - ls[i_max].get_first().y) / (ls[i_max].get_last() - ls[i_max].get_first()).magnitude();
+            var alpha = RobotFrame.arcsin(sin_alpha);
+
+            var ps_f = new Point3d_GL[ls.Length];
+            for (int i = 0; i < ls.Length; i++)
+            {
+                ps_f[i] = ls[i].get_first();
+            }
+
+
+
+
+            return 0;
+        }
+
+        public static List<Point3d_GL> cut_pattern_in_contour_xy_cv(List<Point3d_GL> contour, List<Point3d_GL> pattern)
+        {
+            var size_im = new Size(1000, 1000);
+            var min_p = Point3d_GL.Min(contour.ToArray());
+            var cont_nz = Point3d_GL.add_arr(contour, -min_p+new Point3d_GL(1,1,1));
+            var max_pz = Point3d_GL.Max(cont_nz.ToArray()) + new Point3d_GL(1, 1, 1);
+            var k =  size_im.Width/Math.Max(max_pz.x, max_pz.y);
+
+            var cont_im = new VectorOfPoint();
+            for(int i=0; i<contour.Count;i++)
+            {
+                var p = cont_nz[i] * k;
+                cont_im.Push(new Point[] { new Point((int)p.x, (int)p.y) });
+            }
+            var im = new Image<Gray, Byte>(size_im);
+            var im_patt = new Image<Gray, Byte>(size_im);
+            CvInvoke.FillPoly(im, cont_im, new MCvScalar(255));
+            CvInvoke.FillPoly(im_patt, cont_im, new MCvScalar(127));
+            //CvInvoke.Polylines()
+            //CvInvoke.Imshow("cont1", im);
+            var patt_cut = new List<Point3d_GL>();
+            for (int i = 0; i < pattern.Count; i++)
+            {
+                var p = (pattern[i] - min_p + new Point3d_GL(1, 1, 1)) * k;
+                var p_i = new Point((int)p.x, (int)p.y);
+                CvInvoke.Circle(im_patt, p_i, 2, new MCvScalar(255),2);
+                if (p_i.X < 0 || p_i.Y < 0 || p_i.X >= size_im.Width || p_i.Y >= size_im.Height) continue;
+                if (im.Data[p_i.Y, p_i.X, 0] > 0) patt_cut.Add(pattern[i]);
+
+            }
+
+            //CvInvoke.Imshow("cont2", im_patt);
+            //CvInvoke.WaitKey();
+            return patt_cut;
+        }
+
+        public static List<Point3d_GL> gen_traj_3d_pores(PatternSettings settings,TrajParams trajParams)
+        {
+            var traj_layers = new List<LayerPath>();
+            var dim_cur = new Point3d_GL(settings.dim_x, settings.dim_y);
+            var dim_const = new Point3d_GL(settings.dim_x, settings.dim_y);
+            var A_filling = settings.filling;
+            settings.filling = 0;
+            var df = A_filling / (trajParams.layers / 3);
+            for (int i=0; i<trajParams.layers;i++)
+            {
+                if (i > trajParams.layers / 2) settings.start_dir_r = false;
+                else settings.start_dir_r = true;
+                if (i % 2 == 0) { settings.angle = pi / 2; dim_cur = new Point3d_GL(settings.dim_y, settings.dim_x); }
+                else { settings.angle = 0; dim_cur = new Point3d_GL(settings.dim_x, settings.dim_y); }
+
+                if (i < trajParams.layers / 3) settings.filling += df;
+                else if((i < 2*trajParams.layers / 3) && (i >=   trajParams.layers / 3)) settings.filling -= df;
+                else settings.filling =0;
+
+                var layer = gen_pattern_in_square_xy(settings, new Point3d_GL(), dim_cur);
+                //layer.add(new Point3d_GL(0,0,trajParams.dz * ((int)(i/2)+1))+ dim_const / 2);
+                layer.add(new Point3d_GL(0, 0, trajParams.dz * ((int)(i ) + 1)) + dim_const / 2);
+                traj_layers.Add(layer);
+                //Console.WriteLine(settings.filling);
+                //settings.angle += pi / 2;
+            }
+            var traj = new TrajectoryPath { layers = traj_layers };
+            traj = Trajectory.OptimizeTranzitions2LayerPath(traj);
+            var traj_ps = traj.to_ps();
+            return traj_ps;
+        }
+
+        public static TrajectoryPath gen_traj_2d(List<List<Point3d_GL>> contour, TrajParams trajParams, PatternSettings settings)
+        {
+            var traj_layers = new List<LayerPath>();
+            var min_p = Point3d_GL.Min(contour) - new Point3d_GL(trajParams.step,trajParams.step, trajParams.step);
+            var max_p = Point3d_GL.Max(contour) + new Point3d_GL(trajParams.step,  trajParams.step, trajParams.step);
+            var ang_saved = settings.angle;
+            for (int i = 0; i < contour.Count; i++)
+            {
+                var layer = gen_pattern_in_contour_xy(settings, trajParams, contour[i].ToList(), min_p, max_p);
+                if (layer != null)
+                { 
+                    layer.add(new Point3d_GL(0, 0, trajParams.dz * (1 + i)));
+                    traj_layers.Add(layer);
+                    settings.angle += settings.angle_layers;
+                }
+            }
+            if (traj_layers.Count == 0) return null;
+            settings.angle = ang_saved;
+            var traj = new TrajectoryPath { layers = traj_layers };
+            Console.WriteLine("Layers__________");
+            traj = Trajectory.OptimizeTranzitions2LayerPath(traj);
+            Console.WriteLine("Layers----------");
+            //var traj_ps = traj.to_ps_by_layers();
+            return traj;
+        }
+        static List<Point3d_GL> GeneratePositionTrajectory(List<Point3d_GL> contour, double step)
+        {
+            var traj = new List<Point3d_GL>();
+            var y_min = double.MaxValue;
+            var y_max = double.MinValue;
+            var i_min = 0;
+            var i_max = 0;
+            for(int i=0; i<contour.Count; i++)
+            {
+                if(contour[i].y<y_min)
+                {
+                    y_min = contour[i].y;
+                    i_min = i;
+                }
+                if (contour[i].y > y_max)
+                {
+                    y_max = contour[i].y;
+                    i_max = i;
+                }
+            }
+            var p_min = contour[i_min];
+            var p_max = contour[i_max];
+            var y = step * (int)(p_min.y / step);
+            int flagRL = 0;
+            while(y<p_max.y)
+            {
+                var ps = FindPoints_for_line(contour, y);
+                if((ps.Count == 4) && (flagRL == 0))
+                {
+                    var p12 = FindCross_for_line(ps, y);
+                    if((p12[1] - p12[0]).magnitude_xy()>0.1)
+                    {
+                        traj.Add(p12[1]); traj.Add(p12[0]);
+                        flagRL = 1;
+                    }
+                }
+                else if ((ps.Count == 4) && (flagRL == 1))
+                {
+                    var p12 = FindCross_for_line(ps, y);
+                    if ((p12[1] - p12[0]).magnitude_xy() > 0.1)
+                    {
+                        traj.Add(p12[0]); traj.Add(p12[1]);
+                        flagRL = 0;
+                    }
+                }
+                y += step;
+            }
+            return traj;
+        }
+        
+        static List<Point3d_GL> GeneratePositionTrajectory_angle(List<Point3d_GL> contour, double step, double angle)
+        {
+            var contour_rotate = Point3d_GL.rotate_points(contour, angle);
+            var traj = GeneratePositionTrajectory(contour_rotate, step);
+            var traj_rotate = Point3d_GL.rotate_points(traj, -angle);
+            return traj_rotate;
+        }
+        static List<Point3d_GL> set_z_layer(List<Point3d_GL> traj, double z)
+        {
+            for (int i = 0; i < traj.Count; i++)
+            {
+                traj[i] =  new Point3d_GL(traj[i].x, traj[i].y, z);
+            }
+            return traj;
+        }
+        public static List<List<Point3d_GL>> Generate_multiLayer2d_mesh(List<List<Point3d_GL>> contour, TrajParams trajParams,double z = 0)
+        {
+
+            var traj = new List<List<Point3d_GL>>();
+            for (int i=0;i < contour.Count; i++)
+            {
+                var alfa2 = trajParams.layers_angle;
+                if (i % 2 == 0)
+                {
+                    alfa2 += Math.PI / 2;
+                }
+                
+                var layer = set_z_layer(GeneratePositionTrajectory_angle(contour[i], trajParams.step, alfa2), trajParams.z[i]);
+                traj.Add(layer);
+            }
+        
+
+    //traj = Trajectory.optimize_tranzitions_2_layer(traj)
+            for (int i=0; i<traj.Count; i++)
+            {
+                if (i != traj.Count - 1)
+                {
+                    if (traj[i].Count > 0)
+                    {
+                        var last_pos = traj[i][traj[i].Count-1].Copy();
+                        last_pos.z = trajParams.z[i + 1];
+                        traj[i].Add(last_pos); 
+                    }                    
+                }
+                
+            }
+            
+
+            return traj;
+        }
+        public static List<List<Point3d_GL>> generate_2d_traj(List<List<Point3d_GL>> contour, TrajParams trajParams)
+        {
+
+            var traj = new List<List<Point3d_GL>>();
+            for (int i = 0; i < contour.Count; i++)
+            {
+                var alfa2 = trajParams.layers_angle;
+                if (i % 2 == 0)
+                {
+                    alfa2 += Math.PI / 2;
+                }
+
+                var layer = GeneratePositionTrajectory_angle(contour[i], trajParams.step, alfa2);
+                traj.Add(layer);
+            }
+
+
+            //traj = Trajectory.optimize_tranzitions_2_layer(traj)
+            for (int i = 0; i < traj.Count; i++)
+            {
+                if (i != traj.Count - 1)
+                {
+                    if (traj[i].Count > 0)
+                    {
+                        traj[i].Add(traj[i][traj[i].Count - 1].Copy());
+                    }
+                }
+
+            }
+
+            traj = Trajectory.OptimizeTranzitions2Layer(traj);
+            return traj;
+        }
+
+        public static List<Point3d_GL> filter_traj(List<Point3d_GL> layer, double fil_step)
+        {
+            var traj_fil = new List<Point3d_GL>();
+            traj_fil.Add(layer[0]);
+            for(int i=1; i<layer.Count;i++)
+            {
+                if((layer[i]-traj_fil[traj_fil.Count-1]).magnitude()>fil_step)
+                {
+                    traj_fil.Add(layer[i]);
+                }
+            }
+            return traj_fil;
+        }
+        public static List<Point3d_GL> divide_traj(List<Point3d_GL> layer,double div_step, bool with_end = false)
+        {
+            var traj_div = new List<Point3d_GL>();
+            for(int i=0; i<layer.Count-1;i++)
+            {
+                traj_div.Add(layer[i]);
+                var dist = (layer[i + 1] - layer[i]).magnitude();
+                if(2*dist>div_step)
+                {
+                    var n = (int)(dist / div_step);
+                    for (int j = 0; j < n; j++)
+                    {
+                        traj_div.Add(
+                            new Point3d_GL(
+                            layer[i].x + (div_step * j * (layer[i + 1].x - layer[i].x)) / dist,
+                            layer[i].y + (div_step * j * (layer[i + 1].y - layer[i].y)) / dist,
+                            layer[i].z + (div_step * j * (layer[i + 1].z - layer[i].z)) / dist
+                            ));
+                    }
+                    if (with_end)
+                    {
+                        traj_div.Add(layer[i + 1]);
+                    }
+                }
+                
+            }
+            return traj_div;
+        }
+        //--------------------
+        public static List<Point3d_GL> unif_dist(List<Point3d_GL> ps, double fil_step)
+        {
+            var ps_u = new List<Point3d_GL>();
+            ps_u.Add(ps.First());
+            for(int i=1; i < ps.Count;)
+            {
+                var i_cur = i;
+                var p_cur = ps_u.Last();
+                var p1 = ps[i - 1];
+                var p2 = ps[i];
+                var line = new Line3d_GL(p1, p2);
+                var ps_cr = line.calcCrossSphere(p_cur, fil_step);
+                if(ps_cr!=null)
+                {
+                    var p_sel = new Point3d_GL();
+                    var d0 = (ps_cr[0] - p2).magnitude();
+                    var d1 = (ps_cr[1] - p2).magnitude();
+                    if(d0<d1)  p_sel = ps_cr[0];
+                    else p_sel = ps_cr[1];
+
+                    if(Point3d_GL.affil_p_seg(p1,p2,p_sel))
+                    {
+                        ps_u.Add(p_sel);
+                    }
+                    else
+                    {
+                        i++;
+                    }
+                }
+            }
+
+            return ps_u;
+        }
+        public static List<RobotFrame> unif_dist(List<RobotFrame> ps, double fil_step)
+        {
+            var ps_u = new List<RobotFrame>();
+            ps_u.Add(ps.First());
+            for (int i = 1; i < ps.Count;)
+            {
+                var p_cur = ps_u.Last();
+                var p1 = ps[i - 1];
+                var p2 = ps[i];
+                var line = new Line3d_GL(p1.get_pos(), p2.get_pos());
+                var ps_cr = line.calcCrossSphere(p_cur.get_pos(), fil_step);
+                if (ps_cr != null)
+                {
+                    var p_sel = new Point3d_GL();
+                    var d0 = (ps_cr[0] - p2.get_pos()).magnitude();
+                    var d1 = (ps_cr[1] - p2.get_pos()).magnitude();
+                    if (d0 < d1) p_sel = ps_cr[0];
+                    else p_sel = ps_cr[1];
+
+                    if (Point3d_GL.affil_p_seg(p1.get_pos(), p2.get_pos(), p_sel))
+                    {
+                        var k = (p_sel - p1.get_pos()).magnitude();
+                        var d = (p2.get_pos()- p1.get_pos()).magnitude();
+                        if(d!=0)
+                        {
+                            var p_bt = p1 + (p2 - p1) * (k / d);
+                            p_bt.A = p1.A;
+                            p_bt.B = p1.B;// / 2;
+                            p_bt.C = p1.C;// / 2;
+                            ps_u.Add(p_bt);
+                        }
+                       
+                    }
+                    else
+                    {
+                        i++;
+                    }
+                }
+            }
+
+            return ps_u;
+        }
+
+        public static RobotFrame[] line_aver_btw(RobotFrame[] ps, int iter)
+        {
+            if (ps == null) return null;
+            if (ps.Length < 3) return null;
+            var ps_s = new RobotFrame[ps.Length];
+            ps_s[0] = ps[0];
+            ps_s[ps.Length-1] = ps[ps.Length - 1];
+            for (int i = 1; i < ps.Length - 1; i++)//from 0 to i
+            {
+                int beg = i - 1; //if (beg < 0) beg = 0;
+                int end = i + 1; //if (end > ps.Length - 1) end = ps.Length - 1;
+                                 // var L_p = (ps[end] - ps[i]) * 0.5 + (ps[beg] - ps[i]) * 0.5;
+                ps_s[i] = (ps[i - 1] + ps[i + 1]) / 2;
+            }
+            iter--;
+
+            if (iter <= 0)
+                return ps_s;
+            else
+                return line_aver_btw(ps_s, iter);
+        }
+        //static public Point3d_GL cross_sphere_vec(Point3d_GL p1, Point3d_GL p2, Point3d_GL p_c,)
+        //--------------------
+        static Vector3d_GL comp_vecx(Vector3d_GL vec_x_dir, Vector3d_GL n)
+        {
+            var y = (n | vec_x_dir).normalize();
+            var x = (y | n).normalize();
+            return x;
+        }
+        static Vector3d_GL comp_vecz(Vector3d_GL vec_x, Vector3d_GL normal)
+        {
+            var y = (normal | vec_x).normalize();
+            var n = (vec_x | y).normalize();
+            return n;
+        }
+
+
+        static Matrix<double> proj_point(Polygon3d_GL polyg, Point3d_GL point, Vector3d_GL vec_x_dir)//only xy scans
+        {
+
+            /*var vec_y = (polyg.flat3D.n | vec_x_dir).normalize();
+            //Console.WriteLine(vec_y);
+            var vec_x = (vec_y | polyg.flat3D.n).normalize();
+            //Console.WriteLine(vec_x);
+            var vec_z = polyg.flat3D.n;
+            //Console.WriteLine(vec_z);
+            //Console.WriteLine("_________________");
+            */
+            var n = polyg.flat3D.n;
+            if (n.z < 0) n *= -1;
+            var vec_x = comp_vecx(vec_x_dir, n);
+            var vec_z = comp_vecz(vec_x, n);
+            var vec_y = (vec_z | vec_x).normalize();
+
+            var p_proj = polyg.project_point_xy(point);
+
+            //var p_proj = polyg.ps[0];
+            /*return new Matrix<double>(new double[,]
+            {
+                { vec_x.x,vec_x.y,vec_x.z,p_proj.x},
+                 { vec_y.x,vec_y.y,vec_y.z,p_proj.y},
+                  { vec_z.x,vec_z.y,vec_z.z,p_proj.z+point.z},
+                   { 0,0,0,1}
+            });*/
+
+            return new Matrix<double>(new double[,]
+            {
+                { vec_x.x,vec_y.x,vec_z.x,p_proj.x},
+                 { vec_x.y,vec_y.y,vec_z.y,p_proj.y},
+                  { vec_x.z,vec_y.z,vec_z.z,p_proj.z+point.z},
+                   { 0,0,0,1}
+            });
+        }
+        public static Matrix<double> proj_point_test(Polygon3d_GL polyg, Vector3d_GL vec_x_dir)
+        {
+
+            var vec_y = (polyg.flat3D.n | vec_x_dir).normalize();
+            //Console.WriteLine(vec_y);
+            var vec_x = (vec_y | polyg.flat3D.n).normalize();
+            //Console.WriteLine(vec_x);
+            var vec_z = polyg.flat3D.n;
+            //Console.WriteLine(vec_z);
+            //Console.WriteLine("_________________");
+            //var p_proj = polyg.project_point_xy(point);
+            var p_proj = new Point3d_GL(10, 10, 0);
+            //var p_proj = polyg.ps[0];
+            return new Matrix<double>(new double[,]
+            {
+                { vec_x.x,vec_x.y,vec_x.z,p_proj.x},
+                { vec_y.x,vec_y.y,vec_y.z,p_proj.y},
+                { vec_z.x,vec_z.y,vec_z.z,p_proj.z},
+                { 0      ,      0,      0,       1}
+            });
+        }
+
+        public static List<Matrix<double>> project_layer(Polygon3d_GL[] surface, List<Point3d_GL> layer, RasterMap map_xy, Vector3d_GL vec_x_dir)
+        {
+            var layer_3d = new List<Matrix<double>>();
+            for (int i = 0; i < layer.Count; i++)
+            {
+                var polyg_inds = map_xy.get_polyg_ind_prec_xy(layer[i], surface);
+                if (polyg_inds == null) { 
+                    layer_3d.Add(new Matrix<double>(new double[,]
+                    {
+                        {1, 0,0 , layer[i].x },
+                        {0,1 , 0, layer[i].y },
+                        {0,0 , 1, layer[i].z },
+                        {0,0 ,0 ,  1}
+                    }));
+                    continue;
+                }
+                var polyg_ind =RasterMap.find_high_polyg(polyg_inds, layer[i], surface);
+                var proj_matr = proj_point(surface[polyg_ind], layer[i], vec_x_dir);
+                if(proj_matr!=null)
+                    layer_3d.Add(proj_matr);          
+            }
+            if (layer_3d.Count == 0) return null;
+            return layer_3d;
+        }
+
+        public static (List<Matrix<double>>, LayerPath) project_layer_xy(Polygon3d_GL[] surface, LayerPath layer, RasterMap map_xy, Vector3d_GL vec_x_dir)
+        {
+            var layer_3d = new List<Matrix<double>>();
+            var lines_proj = new List<LinePath>();
+            for(var j = 0; j < layer.lines.Count; j++)
+            {
+                var line = layer.lines[j];
+                var line_proj = new List<Point3d_GL>();
+                for (int i = 0; i < line.ps.Count; i++)
+                {
+                    var polyg_inds = map_xy.get_polyg_ind_prec_xy(line.ps[i], surface);
+                    if (polyg_inds == null)
+                    {
+                        layer_3d.Add(new Matrix<double>(new double[,]
+                        {
+                        { 1, 0 , 0, line.ps[i].x },
+                        { 0, 1 , 0, line.ps[i].y },
+                        { 0, 0 , 1, line.ps[i].z },
+                        { 0, 0 , 0,  1}
+                        }));
+                        continue;
+                    }
+                    var polyg_ind = RasterMap.find_high_polyg(polyg_inds, line.ps[i], surface);
+                    var proj_matr = proj_point(surface[polyg_ind], line.ps[i], vec_x_dir);
+                    if (proj_matr != null)
+                    {
+                        layer_3d.Add(proj_matr);
+                        line.ps[i] = line.ps[i].setx(proj_matr[0, 3]);
+                        line.ps[i] = line.ps[i].sety(proj_matr[1, 3]);
+                        line.ps[i] = line.ps[i].setz(proj_matr[2, 3]);
+                        line_proj.Add(line.ps[i].Clone());
+                    }
+                        
+                }
+                lines_proj.Add(new LinePath() { ps = line_proj });
+            }
+            
+            if (layer_3d.Count == 0) return (null,null);
+            return (layer_3d,new LayerPath() { lines = lines_proj});
+        }
+
+        static List<List<Matrix<double>>> add_transit(List<List<Matrix<double>>> traj, double trans_h)
+        {
+            if(traj.Count < 2) return traj;
+            for(int i=0; i< traj.Count;i++)
+            {
+                traj[i][0][3, 3] = 0;
+                var last = traj[i][traj[i].Count - 1].Clone();
+                last[2, 3] += trans_h;
+                last[3, 3] = 0;
+                traj[i].Add(last);
+                var first = traj[i][0].Clone();
+                first[2, 3] += trans_h;
+                first[3, 3] = 0;
+                traj[i].Insert(0, first);
+            }
+            return traj;
+        }
+
+        static List<List<Matrix<double>>> add_transit_out(List<List<Matrix<double>>> traj, double trans_h)
+        {
+            traj[0][0][2, 3] +=trans_h;
+            traj[traj.Count-1][traj[traj.Count - 1].Count-1][2, 3] += trans_h;
+            return traj;
+        }
+        public static List<List<Matrix<double>>> Generate_multiLayer3d_mesh(Polygon3d_GL[] surface, List<List<Point3d_GL>> contour, TrajParams trajParams)
+        {
+            trajParams.comp_z();
+            var traj_2d = Generate_multiLayer2d_mesh(contour, trajParams);
+
+            traj_2d = Trajectory.OptimizeTranzitions2Layer(traj_2d);
+
+            foreach(var v in traj_2d)
+            {
+                // gl?.addTrajPoint(v.ToArray());
+                var ps_p = Point3d_GL.add_arr(v.ToArray(), new Point3d_GL(0, 0, 45));
+               // gl?.addLineMeshTraj(ps_p, Color3d_GL.purple(), "lin_traj");
+            }
+            var traj_3d = new List<List<Matrix<double>>>();
+            double resolut = -1;
+            var map_xy = new RasterMap(surface, resolut,RasterMap.type_map.XY);
+            var ang_x = trajParams.ang_x;
+            var vec_x = new Vector3d_GL(Math.Cos(ang_x), Math.Sin(ang_x), 0);
+            for (int i=0; i<traj_2d.Count;i++)
+            {
+                var traj_df = filter_traj(divide_traj(traj_2d[i], trajParams.div_step), trajParams.div_step / 2);
+                traj_3d.Add(project_layer(surface, traj_df, map_xy, vec_x));
+            }
+            traj_3d = add_transit(traj_3d, trajParams.h_transf);
+            traj_3d = add_transit_out(traj_3d, trajParams.h_transf_out);
+            return traj_3d;
+        }
+
+        public static List<List<Matrix<double>>> generate_3d_traj_diff_surf(List<Polygon3d_GL[]> surface, List<List<Point3d_GL>> contour, TrajParams trajParams, PatternSettings patternSettings = null)
+        {
+            trajParams.comp_z();
+            var traj_2d = new List<List<Point3d_GL>>();
+            if (patternSettings != null) traj_2d = gen_traj_2d(contour, trajParams, patternSettings).to_ps_by_layers();
+            else traj_2d = generate_2d_traj(contour, trajParams);
+
+            //gl.addLineMeshTraj(traj_2d[0].ToArray(), Color3d_GL.blue());
+            
+            var traj_3d = new List<List<Matrix<double>>>();
+            double resolut = -1;
+            
+            var ang_x = trajParams.ang_x;
+            var vec_x = new Vector3d_GL(Math.Cos(ang_x), Math.Sin(ang_x), 0);
+            for (int i = 0; i < traj_2d.Count; i++)
+            {
+                var map_xy = new RasterMap(surface[i], resolut, RasterMap.type_map.XY);
+                var traj_df = filter_traj(divide_traj(traj_2d[i], trajParams.div_step), trajParams.div_step / 2);
+                //if (imb != null) imb.Image = UtilOpenCV.draw_map_xy(map_xy, surface[i], traj_df.ToArray());
+                var proj_layer = project_layer(surface[i], traj_df, map_xy, vec_x);
+                //gl.addLineMeshTraj(matr_to_traj(proj_layer).ToArray(), Color3d_GL.purple());
+                if (proj_layer == null) continue;
+                traj_3d.Add(proj_layer);
+            }
+            
+            traj_3d = add_transit(traj_3d, trajParams.h_transf);
+            return traj_3d;
+        }
+        public static TrajectoryPath generate_3d_traj_diff_surf_test(List<Polygon3d_GL[]> surface, List<List<Point3d_GL>> contour, TrajParams trajParams, PatternSettings patternSettings = null)
+        {
+            trajParams.comp_z();
+            
+            var traj_2d = gen_traj_2d(contour, trajParams, patternSettings);
+
+            if(traj_2d == null) return null;
+            //gl.addLineMeshTraj(traj_2d[0].ToArray(), Color3d_GL.blue());
+
+            var traj_3d = new List<List<Matrix<double>>>();
+            var traj_2d_rob = new List<LayerPath>();
+            double resolut = -1;
+
+            var ang_x = trajParams.ang_x;
+            var vec_x = new Vector3d_GL(Math.Cos(ang_x), Math.Sin(ang_x), 0);
+            for (int i = 0; i < traj_2d.layers.Count; i++)
+            {
+                var map_xy = new RasterMap(surface[i], resolut, RasterMap.type_map.XY);
+                var traj_df = traj_2d.layers[i].filter_traj( trajParams.div_step / 2);
+               // if (imb != null) imb.Image = UtilOpenCV.draw_map_xy(map_xy, surface[i], traj_df.to_ps().ToArray());
+
+               // UtilOpenCV.draw_map_xy(map_xy, surface[i], traj_df.to_ps().ToArray());
+                LayerPath proj_layer_xy;
+                List<Matrix<double>> proj_layer;
+                (proj_layer,proj_layer_xy) = project_layer_xy(surface[i], traj_df, map_xy, vec_x);
+                //gl.addLineMeshTraj(matr_to_traj(proj_layer).ToArray(), Color3d_GL.purple());
+                if (proj_layer == null) continue;
+                traj_3d.Add(proj_layer);
+                traj_2d_rob.Add(proj_layer_xy);
+            }
+
+            /*traj_3d = add_transit(traj_3d, trajParams.h_transf);
+            var layers = new List<LayerPath>();
+            for (int i=0; i < traj_3d.Count; i++)
+            {
+                var lay_ps = matr_to_traj(traj_3d[i]);
+                var layer = parse_layerpath_from_ps(lay_ps, trajParams.div_step, patternSettings.step);
+                if(layer!= null) layers.Add(layer);
+            }*/
+            return new TrajectoryPath() { layers = traj_2d_rob };
+        }
+        public static List<Point3d_GL> project_contour_on_surface(Polygon3d_GL[] surface, List<Point3d_GL> contour)
+        {
+            var cont_proj = new List<Point3d_GL>();
+            for(int i=0; i< contour.Count; i++)
+            {
+                cont_proj.Add(new Point3d_GL() { x = contour[i].x, y = contour[i].y });
+            }
+            double resolut = 0.2;
+            var map_xy = new RasterMap(surface, resolut, RasterMap.type_map.XY);
+
+            var proj_c = project_layer(surface, cont_proj, map_xy, new Vector3d_GL(1,0,0));
+            
+            return matr_to_ps(proj_c);
+        }
+
+        public static List<RobotFrame> generate_robot_traj(List<Matrix<double>> traj, RobotFrame.RobotType type_robot,TrajParams trajParams = null)
+        {
+            var traj_rob = new List<RobotFrame>();
+            var r_syr = 14.8/2;
+            var v = trajParams.vel;
+            //s_syr*f = s_nos*v
+            var f = ((trajParams.dz * trajParams.line_width) * v) / (3.1415 * r_syr * r_syr);
+
+           
+            for (int i = 0; i < traj.Count; i++)
+            {
+                var fr = new RobotFrame(traj[i],type_robot);
+                fr.X += trajParams.off_x;
+                fr.Y += trajParams.off_y;
+                fr.V = v;
+                fr.F = f;
+                traj_rob.Add(fr);
+            }
+            // traj_rob = unif_dist(traj_rob, 0.5);
+            //traj_rob = line_aver_btw(traj_rob.ToArray(), 10).ToList();
+            // traj_rob = divide_traj(traj_rob, trajParams.div_step);
+            Console.WriteLine("def:__"+traj_rob[10].ToStr());
+            traj_rob = unif_dist(traj_rob, trajParams.div_step );
+            Console.WriteLine("unif:__" + traj_rob[10].ToStr() );
+           traj_rob = RobotFrame.smooth_angle(traj_rob, trajParams.w_smooth_ang);
+            Console.WriteLine("smooth:__" + traj_rob[10].ToStr());
+            traj_rob = RobotFrame.decrease_angle(traj_rob, trajParams.k_decr_ang,type_robot);
+            Console.WriteLine("decriase:__" + traj_rob[10].ToStr());
+            for (int i = 0; i < traj_rob.Count; i++)
+            {
+                //graphic?.addFrame(traj_rob[i].getMatrix(), 5, "sda");
+            }
+
+            return traj_rob;
+        }
+        public static string generate_printer_prog(List<Matrix<double>> traj,  TrajParams trajParams = null)
+        {
+            var traj_rob = new List<RobotFrame>();
+            var f = trajParams.Vel;
+
+            for (int i = 1; i < traj.Count; i++)
+            {
+                var fr1 = new RobotFrame(traj[i-1], RobotFrame.RobotType.FABION2);
+                var fr2 = new RobotFrame(traj[i], RobotFrame.RobotType.FABION2);
+                fr2.V = RobotFrame.dist(fr1,fr2)*trajParams.line_width*trajParams.dz;
+                fr2.F = f;
+                traj_rob.Add(fr2);
+            }
+            //traj_rob = RobotFrame.smooth_angle(traj_rob, 5);
+            //traj_rob = RobotFrame.decrease_angle(traj_rob, 0.5);
+
+            return RobotFrame.generate_string_fabion(traj_rob.ToArray());
+        }
+        
+        public static List<Point3d_GL> matr_to_ps(List<Matrix<double>> traj)
+        {
+            var traj_rob = new List<Point3d_GL>();
+
+            for (int i = 0; i < traj.Count; i++)
+            {
+                var f = new RobotFrame(traj[i]);
+                traj_rob.Add(new Point3d_GL(f.X, f.Y, f.Z));
+            }
+
+            return traj_rob;
+        }
+        public static List<Matrix<double>> ps_to_matr(List<Point3d_GL> ps)
+        {
+            var traj_rob = new List<Matrix<double>>();
+
+            for (int i = 0; i < ps.Count; i++)
+            {
+                var color_cur = new Color3d_GL(0,0,0);
+                if (ps[i].color != null) color_cur = ps[i].color;
+                traj_rob.Add(new Matrix<double>(new double[,]
+                {
+                    
+                    { 1,0,0,ps[i].x},
+                    { 0,1,0,ps[i].y},
+                    { 0,0,1,ps[i].z},
+                    { color_cur.r,color_cur.g,color_cur.b,1 }
+                }));
+            }
+
+            return traj_rob;
+        }
+
+        public static List<Matrix<double>> traj_to_matr(List<RobotFrame> ps)
+        {
+            var traj_rob = new List<Matrix<double>>();
+
+            for (int i = 0; i < ps.Count; i++)
+            {
+                //var color_cur = new Color3d_GL(0, 0, 0);
+               // if (ps[i].color != null) color_cur = ps[i].color;
+                traj_rob.Add(ps[i].getMatrix());
+            }
+
+            return traj_rob;
+        }
+        public static string generate_robot_traj_old(List<Matrix<double>> traj)
+        {
+            var traj_rob = new StringBuilder();
+            double v = 20;
+            for(int i = 0; i<traj.Count; i++)
+            {
+                var x = traj[i][0, 3];
+                var y = traj[i][1, 3];
+                var z = traj[i][2, 3];
+                double b = Math.Asin(-traj[i][2, 0]);
+                double a = 0;
+                double c = 0;
+                if( Math.Cos(b)!=0)
+                {
+                    c =  Math.Asin(traj[i][2, 1] / Math.Cos(b));
+                    a =  Math.Asin(traj[i][1, 0] / Math.Cos(b));
+                }
+                int e = (int)traj[i][3, 3];
+
+                traj_rob.Append(
+                    " X" + round(x) + ", Y" + round(y) + ", Z" + round(z) +
+                    ", A" + round(a) + ", B" + round(0.5*b) + ", C" + round(0.5 * c) + 
+                    ", V" + round(v) + ", D" + e+" \n"
+                    );
+                
+            }
+
+            traj_rob.Append("q\n");
+            return traj_rob.ToString();
+        }
+
+        static double round(double val)
+        {
+            return Math.Round(val,4);
+        }
+
+
+        
+        
+
+    }
+    public class StepperPrinter
+    {
+
+        public double safe_z = 30; //150
+
+        public double safe_z_internal = -350; //150
+
+        public StepperFrame cur_frame = new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0);
+        public StepperFrame offset_frame = new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0);
+
+        public StepperFrame offset_plate = new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0);
+
+        public StepperFrame[] offset_nossle = { new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0), new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0), new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0), new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0) };
+        public StepperFrame[] offset_zero_pos = { new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0), new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0), new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0), new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0) };
+
+        public StepperFrame offset_internal = new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0);
+
+
+        public enum coordinate_system { MANUAL, AUTO, INTERNAL, CURRENT }
+        public coordinate_system cur_coordinate_system = coordinate_system.CURRENT;
+        public coordinate_system dest_coordinate_system = coordinate_system.MANUAL;
+
+
+        public bool table_out = false;
+        public bool cover_up = false;
+
+        static public int prog_loaded_bef_start = 4;
+        static public double min_temp_bed = 25;
+        public double abs_pos_extr = 0;
+        
+        static double cos30 = 0.86602540378;
+        static double sin30 = 0.5;
+
+        static public double min_dist_printer = 0.2;
+        static public double min_dist = 0.1;
+
+        static public double min_time = 10;//ms
+
+        static public double min_count_time = min_time * 100;//ms
+
+        static public double min_vel = 2.1;
+
+
+        static public double printer_max_r = 0.3;
+
+        public int cur_prog_number = 0;
+        
+        public Point3d_GL p_xyz_steps = new Point3d_GL(steps_xyz, steps_xyz, steps_xyz);
+        public double e_steps = 100;
+        public double t_coef = 104616.18;
+        public int lookup_buf = 100;
+        public int safe_len_send_val = 40;
+
+
+        static double steps_xyz = 800;//800
+        public double R = 176.5;// 141; //150
+        public double r = 47.5;//34;  //40
+        public double l = 320;//218;  //215
+        public double printing_r = 100;
+        public double a_off = 0;// 0.3; //0
+        public double b_off = 0;// 0.24; //0 
+        static public double printer_max_acs = 50;//500
+
+
+
+
+        /*static double steps_xyz = 80;
+        public double R =  141; //150
+        public double r = 34;  //40
+        public double l = 218;  //215
+        public double printing_r = 100;
+        public double a_off =  0.3; //0
+        public double b_off =  0.24; //0
+        static public double printer_max_acs = 500;//500*/
+
+        public bool all_motors_stop1 = false;
+        public bool all_motors_stop2 = true;
+
+        Point3d_GL p_a_cent_off = new Point3d_GL();
+        Point3d_GL p_b_cent_off = new Point3d_GL();
+        Point3d_GL p_c_cent_off = new Point3d_GL();
+
+        Point3d_GL p_a_tower = new Point3d_GL();
+        Point3d_GL p_b_tower = new Point3d_GL();
+        Point3d_GL p_c_tower = new Point3d_GL();
+
+        public long[][] points_res_calibrate_abc = new long[20][];
+        public Point3d_GL[] points_for_calibrate_xy = new Point3d_GL[20];
+        public int  delta_calibr_counter = 0;
+        public int delta_calibr_counter_max = 0;
+
+        public bool delta_calibr_en = false;
+
+        public enum delta_calibr_ps_count { ps4,  ps18 };
+
+        public Point3d_GL bed_calib_vec = new Point3d_GL(0.0049,0.0083,1);
+
+        //public Point3d_GL bed_calib_vec = new Point3d_GL(0.0, 0.0, 1);
+
+        public double koef_extrus = 1;
+        public double koef_vel = 1;
+        public int cur_nossle_type = 0;
+        public int cur_plate_type = 0;
+
+        public int tool_active = 0;
+
+        public List<string> prog_orig_commands = new List<string>();
+
+        public List<List<StepperFrame>> main_alternately_commands = new List<List<StepperFrame>>();
+        public int main_alternately_commands_counter = 0;
+
+
+        public List<StepperFrame> alternately_commands = new List<StepperFrame>();
+        public List<StepperFrame> prog_commands = new List<StepperFrame>();
+        public List<StepperFrame> jog_commands = new List<StepperFrame>();
+
+        public enum programm_state { MOVE, STOP, PAUSE, JOG, ALTERNATELY, CALIBRATE }
+        public SettingsString settins_string = null;
+
+        public StepperFrame[] bed_calib_ps = new StepperFrame[3];
+        public int cur_jog_line = 0;
+        public int cur_alternately_line = 0;
+        public int cur_alternately_line_internal = 0;
+        public programm_state prog_state = programm_state.STOP;
+        public int cur_prog_line = 0;
+        public int pause_prog_line = 0;
+
+
+        public long[] cur_pos = new long[] { 0, 0, 0, 0 };
+        public long[] prev_pos = new long[] { 0, 0, 0, 0 };
+
+
+
+        public double travel_xyz_vel = 8;
+        public double jog_xyz_vel = 10;
+        public int ring_en = 0;
+
+        
+
+
+
+        public int ring_buf_en = 0;
+        public int all_steps_kinem = 0;
+        public int all_steps1 = 0;
+        public int prog_done = 0;
+        public int wait_en = 0;
+        public int wait_term = 0;
+
+        public int all_steps2 = 0;
+
+        public int consider_wait_all_steps_kinem = 0;
+        public int consider_all_steps1 = 0;
+        public int consider_prog_done = 0;
+        public int consider_wait_en = 0;
+        public int consider_wait_term = 0;
+
+        public int consider_all_steps2 = 0;
+
+
+        //------------------------------------------
+        public int prev_delta_calib = 0;
+        public int prev_homing = 0;
+        public bool delta_calib_go_next_p = false;
+        public bool delta_calib_nozzle_up = false;
+
+        public int calibr_x = -1;
+        public int calibr_y = -1;
+        public int calibr_z = -1;
+        //----------------------------------------
+        public int max_count_cur_prog = 0;
+        public double jog_len = 100;
+        public int stop_len = 21;
+        public bool stop_len_setted = false;
+        //================================
+        public double calibr_vel = 3d;
+        public bool calibrating_nossle = false;
+        public int calibrate_nossle_stage_counter = 0;
+        public List<StepperFrame> calibrate_nossle_frames = new List<StepperFrame>();
+
+        public int[] tool_inds = new int[4];
+        public bool main_alternately_commands_exec = false;
+
+
+
+
+        public bool[] tool_calibrated_auto = { false, false, false, false };
+        public bool[] tool_calibrated_manual = { false, false, false, false };
+        public StepperFrame[] prepare_alternate_g_code_to_load(StepperFrame[] stepper_frames, StepperFrame offset, StepperFrame cur_frame)
+        {
+            var frames_out = new List<StepperFrame>();
+            var frames_kinematic = new List<StepperFrame>();
+            int kinematic_count = 0;
+            var last_frame = cur_frame.clone();
+            last_frame.e = 0;
+
+            Console.WriteLine("offset_alternate: " + offset.p_xyz + " " + offset.e);
+            for (int i = 0; i < stepper_frames.Length; i++)
+            {
+                if (stepper_frames[i].kinematic)
+                {
+                    if (kinematic_count == 0)
+                    {
+                        frames_kinematic.Add(last_frame);
+                    }
+
+                    frames_kinematic.Add(stepper_frames[i]);
+
+                    last_frame = stepper_frames[i].clone();
+                    kinematic_count++;
+                }
+                else
+                {
+                    if (frames_kinematic.Count > 0)
+                    {
+                        var conv_frames = convert_g_code(frames_kinematic.ToArray(), offset).ToList();
+                        var frames_kinematic_prep = prepare_g_code_to_load(conv_frames.ToArray());
+                        frames_kinematic = new List<StepperFrame>();
+                        frames_out.AddRange(frames_kinematic_prep);
+                        kinematic_count = 0;
+                    }
+                    frames_out.Add(stepper_frames[i]);
+
+                }
+
+            }
+
+            if (frames_kinematic.Count > 0)
+            {
+                var conv_frames = convert_g_code(frames_kinematic.ToArray(),  offset).ToList();
+                var frames_kinematic_prep = prepare_g_code_to_load(conv_frames.ToArray());
+                frames_kinematic = new List<StepperFrame>();
+                frames_out.AddRange(frames_kinematic_prep);
+            }
+            return frames_out.ToArray();
+        }
+        public StepperFrame[] convert_g_code(StepperFrame[] orig_g_code,  StepperFrame offset)
+        {
+            var off_z = 0d;
+            for (int i = 0; i < orig_g_code.Length; i++)
+            {
+                orig_g_code[i].p_xyz += offset.p_xyz;
+                //orig_g_code[i].e += offset.e;
+                orig_g_code[i].p_xyz.z += comp_off_bed(orig_g_code[i].p_xyz) - off_z;
+
+                Console.WriteLine(i + " " + orig_g_code[i].p_xyz.x + " " + orig_g_code[i].p_xyz.y + " " + orig_g_code[i].p_xyz.z + " " + orig_g_code[i].e);
+            }
+
+            var stepper_frames = StepperFrame.convert_frames_v3(
+                orig_g_code,
+                 StepperPrinter.printer_max_acs,        //acs  mm/s^2
+                 StepperPrinter.printer_max_r);      //max r  mm
+
+            if (stepper_frames == null) return null;
+            var coms = new List<StepperFrame>();
+
+            //coms.Add(new StepperFrame(1, 588, "F0", true));//   ring_buf_all_counter_write
+            //coms.Add(new StepperFrame(1, 587, "I7 C0", true));//  e = 0
+            //printer.abs_pos_extr = 0;
+            var test_abs_e = 0d;
+            for (int i = 0; i < stepper_frames.Length; i++)
+            {
+                //if (i == 10) coms.Add(new StepperFrame(1, 588, "A1 D0 C" + stepper_frames.Length,true)); //ring_buf_en = 1; ring_buf_counter = 0; ring_buf_end = stepper_frames.Length
+                //var l = stepper_frames[i].get_command(printer);
+                //Console.Write(""+ l+" "+ stepper_frames[i].p_xyz);
+                test_abs_e += stepper_frames[i].e;
+                //Console.WriteLine(" p: " + stepper_frames[i].p_xyz + " " + test_abs_e);
+                coms.Add(stepper_frames[i]);
+            }
+            return coms.ToArray();
+        }
+        public static int comp_stop_len(StepperFrame[] stepper_frames)
+        {
+            int stop_len = 0;
+            for (int i = 0; i < stepper_frames.Length; i++)
+            {
+                if (stepper_frames[i].kinematic && stepper_frames[i].movement)
+                {
+                    stop_len++;
+                }
+            }
+            return stop_len;
+        }
+
+        public StepperFrame[] prepare_g_code_to_load(StepperFrame[] stepper_frames)
+        {
+            var coms = new List<StepperFrame>();
+            cur_prog_number++;
+            coms.Add(new StepperFrame(1, 588, "A0 F0 B" + lookup_buf + " C" + stepper_frames.Length, true));//   ring_buf_all_counter_write
+            //coms.Add();//  e = 0
+            var com_reset_e = new StepperFrame(1, 587, "I7 C0", true);
+            com_reset_e.reset_extr = true;
+            coms.Add(com_reset_e);
+            var stop_len = comp_stop_len(stepper_frames);
+            abs_pos_extr = 0;
+            int i_start = Math.Min(StepperPrinter.prog_loaded_bef_start, stop_len - 1);
+            for (int i = 0; i < stop_len; i++)
+            {
+
+                coms.Add(stepper_frames[i]);
+
+                if (i == i_start)
+                {
+                    var fr_len = new StepperFrame(1, 588, "A1 D0 H" + cur_prog_number, true);
+                    fr_len.len = stop_len;
+                    coms.Add(fr_len); //ring_buf_en = 1; ring_buf_counter = 0; ring_buf_end = stepper_frames.Length
+                }
+
+                //var l = stepper_frames[i].get_command(printer);
+                //Console.WriteLine(""+ stepper_frames[i].p_xyz);
+                //var fr_stop = new StepperFrame(1, 588, "A0 D0 C0", true);
+                //coms.Add(fr_stop);
+            }
+            set_prog_ind(ref stepper_frames, cur_prog_number);
+            stepper_frames[stepper_frames.Length - 1].consider_prog_done = 1;
+            return coms.ToArray();
+        }
+        public static void set_prog_ind(ref StepperFrame[] stepper_frames, int ind_prog)
+        {
+            var cur_line_numb = 0;
+            for (int i = 0; i < stepper_frames.Length; i++)
+            {
+                stepper_frames[i].prog_number = ind_prog;
+                if (stepper_frames[i].kinematic && stepper_frames[i].movement)
+                {
+                    stepper_frames[i].line_number = cur_line_numb; cur_line_numb++;
+                }
+            }
+        }
+
+        public static List<List<StepperFrame>> prepare_main_alternate_g_code_to_load(StepperFrame[] stepper_frames)
+        {
+            var main_frames = new List<List<StepperFrame>>();
+            var oct_frames = new List<StepperFrame>();
+
+            for (int i = 0; i < stepper_frames.Length; i++)
+            {
+                if (stepper_frames[i].plate_num == 0)
+                {
+                    if (oct_frames.Count != 0) main_frames.Add(oct_frames);
+                    oct_frames = new List<StepperFrame>();
+                    oct_frames.Add(stepper_frames[i]);
+                    main_frames.Add(oct_frames);
+                    oct_frames = new List<StepperFrame>();
+                }
+                else
+                {
+                    oct_frames.Add(stepper_frames[i]);
+                }
+
+            }
+            if (oct_frames.Count != 0) main_frames.Add(oct_frames);
+            return main_frames;
+        }
+
+        public StepperFrame[] convert_g_code_to_stepperframes(string[] orig_g_code, StepperPrinter printer)
+        {
+            var coms = new List<StepperFrame>();
+
+            var p_offs = new Point3d_GL(0, 0, 0);
+            var e_offs = 0d;
+
+
+            var p_cur = new Point3d_GL(0, 0, 0);
+            var e_cur = 0d;
+
+
+            var vel_cur = 10d;
+            var k_vel = 1d / 60d;//if mm\min
+
+            bool extr_rel = false;
+            bool pos_rel = false;
+
+            var p_abs = new Point3d_GL(0, 0, 0);
+            var e_abs = 0d;
+
+            if (dest_coordinate_system == coordinate_system.AUTO)
+            {
+                coms.Add(new StepperFrame(0, 631, ""));
+                //coms.Add(new StepperFrame(0, 640, "1"));
+                //coms.Add(new StepperFrame(new Point3d_GL(0, 0, safe_z), 0, travel_xyz_vel));
+            }
+            for (int i = 0; i < orig_g_code.Length; i++)
+            {
+                var line = orig_g_code[i].Trim();
+                line = line.Replace("  ", " ");
+                line = line.Replace("  ", " ");
+                var vals = line.Split(' ');
+                //if (vals.Length<2) continue;
+                if (pos_rel)
+                {
+                    p_cur = new Point3d_GL(0, 0, 0);
+                }
+                if (extr_rel || pos_rel)
+                {
+                    e_cur = 0;
+                }
+
+                if (vals[0].Contains("G1") || vals[0].Contains("G0"))
+                {
+
+                    for (int j = 1; j < vals.Length; j++)
+                    {
+                        if (vals[j].Length < 2) continue;
+                        var lit = vals[j][0];
+                        var v_str = vals[j].Substring(1);
+                        var val_parsed = parse_double(v_str);
+                        if (val_parsed == double.NaN) continue;
+                        if (lit == 'X') p_cur.x = val_parsed;
+                        if (lit == 'Y') p_cur.y = val_parsed;
+                        if (lit == 'Z') p_cur.z = val_parsed;
+                        if (lit == 'E') e_cur = val_parsed;
+                        if (lit == 'F') vel_cur = val_parsed * k_vel;
+
+                        
+                    }
+
+                    if (pos_rel)
+                    {
+                        p_abs += new Point3d_GL(p_cur.x, p_cur.y, p_cur.z);
+                    }
+                    else
+                    {
+                        p_abs = new Point3d_GL(p_cur.x, p_cur.y, p_cur.z) + p_offs;
+                    }
+
+
+                    if (extr_rel || pos_rel)
+                    {
+                        e_abs += e_cur;
+                    }
+                    else
+                    {
+                        e_abs = e_cur + e_offs;
+                    }
+                    Console.WriteLine("e_abs: " + e_abs + "; e_cur: " + e_cur + "; e_offs: " + e_offs + "; pos_rel: " + pos_rel);
+                    coms.Add(new StepperFrame(p_abs.Clone(), e_abs, vel_cur));
+                }
+
+
+                if (vals[0].Contains("G2") || vals[0].Contains("G3"))//to do
+                {
+
+                }
+
+                if (vals[0].Contains("G4"))
+                {
+                    double wait_ms = 0;
+                    double wait_s = 0;
+                    for (int j = 1; j < vals.Length; j++)
+                    {
+                        if (vals[j].Length < 2) continue;
+                        var lit = vals[j][0];
+                        var v_str = vals[j].Substring(1);
+                        var val_parsed = parse_double(v_str);
+                        if (val_parsed == double.NaN) continue;
+                        if (lit == 'S') wait_s = val_parsed;
+                        if (lit == 'P') wait_ms = val_parsed;
+                    }
+
+                    coms.Add(new StepperFrame(1, 589, "P" + (wait_ms + 1000 * wait_s).ToString()));
+                }
+
+                if (vals[0].Contains("G28"))
+                {
+                    coms.Add(new StepperFrame(1, 589, "X12"));
+                }
+
+                if (vals[0].Contains("G90"))
+                {
+                    pos_rel = false;
+                    //p_cur = new Point3d_GL(0, 0, 0);
+                    if (extr_rel)
+                    {
+                        //e_cur = 0;
+                    }
+                }
+                if (vals[0].Contains("G91"))
+                {
+                    pos_rel = true;
+                    //e_abs = e_offs;
+                }
+
+                if (vals[0].Contains("M82"))
+                {
+                    extr_rel = false;
+                }
+                if (vals[0].Contains("M83"))
+                {
+                    extr_rel = true;
+                }
+
+                if (vals[0].Contains("G92"))
+                {
+                    var p_st = new Point3d_GL(0, 0, 0);
+                    var e_st = 0d;
+                    var x_en = 0;
+                    var y_en = 0;
+                    var z_en = 0;
+                    var e_en = 0;
+                    for (int j = 1; j < vals.Length; j++)
+                    {
+                        if (vals[j].Length < 2) continue;
+                        var lit = vals[j][0];
+                        var v_str = vals[j].Substring(1);
+                        var val_parsed = parse_double(v_str);
+                        if (val_parsed == double.NaN) continue;
+                        if (lit == 'X') { p_offs.x = p_abs.x; p_abs.x = val_parsed; x_en = 1; p_cur.x = val_parsed; }
+                        if (lit == 'Y') { p_offs.y = p_abs.y; p_abs.y = val_parsed; y_en = 1; p_cur.y = val_parsed; }
+                        if (lit == 'Z') { p_offs.z = p_abs.z; p_abs.z = val_parsed; z_en = 1; p_cur.z = val_parsed; }
+                        if (lit == 'E') { e_offs = e_abs; e_abs = val_parsed; e_en = 1; e_cur = val_parsed; } //
+                    }
+
+                    //coms.Add(new StepperFrame(0, 612, p_st.x + " " + p_st.y + " " + p_st.z + " " + e_st + " " + x_en + " " + y_en + " " + z_en + " " + e_en));
+                    //p_cur = new Point3d_GL(0,0,0);
+
+
+                }
+
+                if (vals[0].Contains("M106"))
+                {
+                    var fan_ind = 0;
+                    var fan_val = 0;
+                    var board_ind = 0;
+                    for (int j = 1; j < vals.Length; j++)
+                    {
+                        if (vals[j].Length < 2) continue;
+                        var lit = vals[j][0];
+                        var v_str = vals[j].Substring(1);
+                        var val_parsed = parse_double(v_str);
+                        if (val_parsed == double.NaN) continue;
+                        if (lit == 'S') fan_val = (int)val_parsed;
+                        if (lit == 'P') fan_ind = (int)val_parsed;
+                        if (lit == 'B') board_ind = (int)val_parsed;
+                    }
+
+                    coms.Add(new StepperFrame(board_ind, 581, "I" + fan_ind + " A" + fan_val));
+                }
+
+                if (vals[0].Contains("M107"))
+                {
+                    var fan_ind = 0;
+                    var fan_val = 0;
+                    var board_ind = 0;
+                    for (int j = 1; j < vals.Length; j++)
+                    {
+                        if (vals[j].Length < 2) continue;
+                        var lit = vals[j][0];
+                        var v_str = vals[j].Substring(1);
+                        var val_parsed = parse_double(v_str);
+                        if (val_parsed == double.NaN) continue;
+                        if (lit == 'S') fan_val = (int)val_parsed;
+                        if (lit == 'P') fan_ind = (int)val_parsed;
+                        if (lit == 'B') board_ind = (int)val_parsed;
+                    }
+
+                    coms.Add(new StepperFrame(board_ind, 581, "I" + fan_ind + " A0"));
+                    pos_rel = false;
+                }
+
+
+                if (vals[0].Contains("M140"))
+                {
+                    var temp_dest = 0d;
+                    for (int j = 1; j < vals.Length; j++)
+                    {
+                        if (vals[j].Length < 2) continue;
+                        var lit = vals[j][0];
+                        var v_str = vals[j].Substring(1);
+                        var val_parsed = parse_double(v_str);
+                        if (val_parsed == double.NaN) continue;
+                        if (lit == 'S') { temp_dest = val_parsed; }
+                    }
+                    if (temp_dest < StepperPrinter.min_temp_bed) coms.Add(new StepperFrame(2, 579, "E0 T" + temp_dest, false, 0));
+                    else coms.Add(new StepperFrame(2, 579, "E1 T" + temp_dest, false, 0));
+
+                }
+
+                if (vals[0].Contains("M190"))
+                {
+                    var temp_dest = 0d;
+                    for (int j = 1; j < vals.Length; j++)
+                    {
+                        if (vals[j].Length < 2) continue;
+                        var lit = vals[j][0];
+                        var v_str = vals[j].Substring(1);
+                        var val_parsed = parse_double(v_str);
+                        if (val_parsed == double.NaN) continue;
+                        if (lit == 'S') { temp_dest = val_parsed; }
+                    }
+
+
+                    if (temp_dest < StepperPrinter.min_temp_bed) coms.Add(new StepperFrame(2, 579, "E0 T" + temp_dest, false, 1));
+                    else coms.Add(new StepperFrame(2, 579, "E1 T" + temp_dest, false, 1));
+                }
+
+                if (vals[0].Contains("T"))
+                {
+                    //main com
+                    int tool_dest_ind = 0;
+                    for (int j = 0; j < vals.Length; j++)
+                    {
+                        if (vals[j].Length < 2) continue;
+                        var lit = vals[j][0];
+                        var v_str = vals[j].Substring(1);
+                        var val_parsed = parse_double(v_str);
+                        if (val_parsed == double.NaN) continue;
+                        if (lit == 'T') { tool_dest_ind = (int)val_parsed; }
+                    }
+
+                    //coms.Add(new StepperFrame(0, 640, "2"));
+                    //coms.Add(new StepperFrame(new Point3d_GL(0, 0, safe_z), 0, travel_xyz_vel));
+
+                    coms.Add(new StepperFrame(0, 620, tool_dest_ind.ToString()));
+
+                    if (dest_coordinate_system == coordinate_system.AUTO)
+                    {
+                        coms.Add(new StepperFrame(0, 631, ""));
+                        //coms.Add(new StepperFrame(0, 640, "1"));
+                        //coms.Add(new StepperFrame(new Point3d_GL(0, 0, safe_z), 0, travel_xyz_vel));
+                    }
+
+                    
+
+                    if (dest_coordinate_system == coordinate_system.MANUAL) coms.Add(new StepperFrame(0, 640, "0"));
+                    if (dest_coordinate_system == coordinate_system.AUTO) coms.Add(new StepperFrame(0, 640, "1"));
+
+                    /*p_abs.z += safe_z;
+                    coms.Add(new StepperFrame(p_abs.Clone(), e_abs, vel_cur));
+
+                    p_abs.z -= safe_z;
+                    coms.Add(new StepperFrame(p_abs.Clone(), e_abs, vel_cur));*/
+                }
+
+                if (vals[0].Contains("G54"))
+                {
+                    var plate_num = 0;
+                    //main com
+                    for (int j = 0; j < vals.Length; j++)
+                    {
+                        if (vals[j].Length < 2) continue;
+                        var lit = vals[j][0];
+                        var v_str = vals[j].Substring(1);
+                        var val_parsed = parse_double(v_str);
+                        if (val_parsed == double.NaN) continue;
+                        if (lit == 'X') { plate_num = (int)val_parsed; }
+                    }
+                    //X - plate select
+                    coms.Add(new StepperFrame(0, 637, plate_num.ToString()));
+                }
+            }
+
+            return coms.ToArray();
+        }
+
+
+        public void start_alternate_prog(StepperFrame[] prog_cur)
+        {
+            offset_frame = comp_offset(cur_coordinate_system);
+
+            var offs = cur_frame.clone();
+            offs.p_xyz -= offset_frame.p_xyz;
+
+            alternately_commands = prepare_alternate_g_code_to_load(prog_cur, offset_frame, offs).ToList();
+            cur_alternately_line = 0;
+
+            prog_state = programm_state.ALTERNATELY;
+
+            consider_wait_all_steps_kinem = 0;
+            consider_all_steps1 = 0;
+            consider_prog_done = 0;
+            consider_wait_en = 0;
+            consider_wait_term = 0;
+
+            consider_all_steps2 = 0;
+        }
+
+        public void start_main_alternate_prog(StepperFrame[] prog_cur)
+        {
+            main_alternately_commands = prepare_main_alternate_g_code_to_load(prog_cur);
+            main_alternately_commands_counter = 0;
+            main_alternately_commands_exec = true;
+        }
+        static public double parse_double(string str)
+        {
+            double v;
+
+            return double.TryParse(str, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v) ? v : double.NaN;
+
+
+        }
+
+
+        public StepperFrame comp_offset(coordinate_system coordinate_system_type)
+        {
+            var p = new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0);
+            if (coordinate_system_type == coordinate_system.AUTO)
+            {
+
+
+                offset_plate.p_xyz = new Point3d_GL(settins_string.offset_plate_x[cur_plate_type], settins_string.offset_plate_y[cur_plate_type], settins_string.offset_plate_z[cur_plate_type]) +
+                    new Point3d_GL(settins_string.offset_las_sys_x, settins_string.offset_las_sys_y, settins_string.offset_las_sys_z);
+                //Console.WriteLine("offset_nossle" + offset_nossle[tool_active].p_xyz);
+                //Console.WriteLine("offset_plate:" + offset_plate.p_xyz + " num:" + cur_plate_type);
+                p = new StepperFrame(offset_nossle[tool_active].p_xyz + offset_plate.p_xyz, 0, jog_xyz_vel);
+
+                //Console.WriteLine("offset_frame:" + offset_frame.p_xyz);
+            }
+
+            else if (coordinate_system_type == coordinate_system.MANUAL)
+            {
+                p = offset_zero_pos[tool_active].clone();
+            }
+            else if (coordinate_system_type == coordinate_system.INTERNAL)
+            {
+                p = offset_internal.clone();
+            }
+            else if (coordinate_system_type == coordinate_system.CURRENT)
+            {
+                p = cur_frame.clone();
+            }
+            return p.clone();
+        }
+        public StepperPrinter()
+        {
+            init_delta_comp();
+        }
+
+        void init_delta_comp()
+        {
+            p_a_cent_off = new Point3d_GL(r * cos30, -r * sin30);
+            p_b_cent_off = new Point3d_GL(-r * cos30, -r * sin30);
+            p_c_cent_off = new Point3d_GL(0, r);
+
+            p_a_tower = new Point3d_GL(R * cos30, -R * sin30);
+            p_b_tower = new Point3d_GL(-R * cos30, -R * sin30);
+            p_c_tower = new Point3d_GL(0, R);
+        }
+
+        public double comp_off_bed(Point3d_GL p_dest)
+        {
+            var dz = (-p_dest.x * bed_calib_vec.x - p_dest.y * bed_calib_vec.y) / bed_calib_vec.z;
+            return dz;
+        }
+        public long[] solve_ik(StepperFrame frame)
+        {
+            if (frame.poses_have) return frame.poses;
+            var p_xyz_ik = new Point3d_GL();
+
+            var p_dest = frame.p_xyz.Clone();
+            //p_dest.z += comp_off_bed(p_dest);
+            //Console.WriteLine(p_dest);
+            var p_z = delta_ik(p_dest);
+
+            p_xyz_ik.x = p_z.x * p_xyz_steps.x;
+            p_xyz_ik.y = p_z.y * p_xyz_steps.y;
+            p_xyz_ik.z = p_z.z * p_xyz_steps.z;
+
+
+
+            //Console.WriteLine("frame.e "+frame.e + " " + e_steps);
+            var e_st = frame.e*e_steps;
+            var time_counts = frame.time_abs*t_coef;
+            var pos = new long[] { 0, 0, 0, 0, 0 };
+            pos[0] = (long)p_xyz_ik.x;
+            pos[1] = (long)p_xyz_ik.y;
+            pos[2] = (long)p_xyz_ik.z;
+            pos[3] = (long)e_st;
+            pos[4] = (long)time_counts;
+
+            return pos;
+        }
+        static public double cos(double x)
+        {
+            return Math.Cos(x * Math.PI/ 180);
+        }
+        static public double sin(double x)
+        {
+            return Math.Sin(x * Math.PI/ 180);
+        }
+
+        //public string calib_17_ps = "14918 14918 14918\r\n11353 11353 17229\r\n14574 8679 16255\r\n16794 9302 13634\r\n17163 12465 10300\r\n15550 15500 8461\r\n12498 17114 10199\r\n9337 16805 13553\r\n8674 14655 16239\r\n13698 13757 16550\r\n15181 12773 16062\r\n16298 12959 14796\r\n16505 14211 13374\r\n15711 15635 12701\r\n14289 16469 13287\r\n13002 16332 14694\r\n12761 15269 16005";
+        public string calib_17_ps = "14917 14917 14918\r\n11155 11155 17033\r\n14376 8482 16058\r\n16604 9113 13445\r\n16978 12281 10117\r\n15366 15317 8280\r\n12314 16930 10018\r\n9146 16614 13363\r\n8481 14462 16047\r\n13504 13563 16357\r\n15003 12570 15860\r\n16115 12776 14589\r\n16314 14031 13168\r\n15511 15461 12501\r\n14077 16286 13106\r\n12802 16132 14519\r\n12554 15062 15823\r\n14885 14925 14940";
+        public void delta_init_calibr(delta_calibr_ps_count  type)
+        {
+            if(type == delta_calibr_ps_count.ps4)
+            {
+                var ps_len = 4;
+                points_res_calibrate_abc = new long[ps_len][];
+                points_for_calibrate_xy = new Point3d_GL[ps_len];
+                var z_safe = 6;
+                var rad1 = printing_r - 25;
+                points_for_calibrate_xy[0] = new Point3d_GL(0, 0, z_safe);
+                points_for_calibrate_xy[1] = new Point3d_GL(rad1 * cos30, -rad1 * sin30, z_safe);
+                points_for_calibrate_xy[2] = new Point3d_GL(-rad1 * cos30, -rad1 * sin30, z_safe);
+                points_for_calibrate_xy[3] = new Point3d_GL(0, rad1, z_safe);
+                delta_calibr_counter_max = 4;
+            }
+
+            if (type == delta_calibr_ps_count.ps18)
+            {
+                var ps_len = 18;
+                points_res_calibrate_abc = new long[ps_len][];
+                points_for_calibrate_xy = new Point3d_GL[ps_len];
+                var z_safe = 6;
+                var rad1 = printing_r - 25;
+                var rad2 = (printing_r - 25)/2;
+                points_for_calibrate_xy[0] = new Point3d_GL(0, 0, z_safe);
+                int j = 1;
+                for (var i = 0; i < 8; i++)
+                {
+                    points_for_calibrate_xy[j] = new Point3d_GL(rad1 * sin(i*45), rad1 * cos(i * 45), z_safe); j++;
+                    //Console.WriteLine(points_for_calibrate_xy[j - 1]);
+                }
+
+                for (var i = 0; i < 8; i++)
+                {
+                    points_for_calibrate_xy[j] = new Point3d_GL(rad2 * sin(i * 45), rad2 * cos(i * 45), z_safe); j++;
+                    //Console.WriteLine(points_for_calibrate_xy[j - 1]);
+                }
+                points_for_calibrate_xy[j] = new Point3d_GL(0, 0, z_safe);
+
+                delta_calibr_counter_max = ps_len;
+            }
+        }
+        public void delta_comp_prop_calibr()
+        {
+            Console.WriteLine("points_res_calibrate_abc-----------------------------------");
+            for (int i = 0; i<points_res_calibrate_abc.Length; i++)
+            {
+                Console.WriteLine(points_res_calibrate_abc[i][0] + " " + points_res_calibrate_abc[i][1] + " " + points_res_calibrate_abc[i][2] + " ");
+            }
+            Console.WriteLine("-----------------------------------------------------------");
+        }
+
+        public void delta_comp_test(double kd = 1,int iter = 3)
+        {
+            var iter_cur = iter;
+            iter_cur--;
+            if (iter_cur == 0) return;
+
+
+            var vals = calib_17_ps.Split("\r\n");
+            
+            var abc_ps_1 = new long[vals.Length][];
+            for (int i = 0; i < vals.Length; i++)
+            {
+                var cur_abc = vals[i].Split(" ");
+                abc_ps_1[i] = new long[3];
+                abc_ps_1[i][0] = Convert.ToInt64(cur_abc[0]);
+                abc_ps_1[i][1] = Convert.ToInt64(cur_abc[1]);
+                abc_ps_1[i][2] = Convert.ToInt64(cur_abc[2]);
+            }
+
+            var abc_ps = new long[abc_ps_1.Length-1][];
+            for (int i = 1; i < abc_ps.Length; i++)
+            {
+                abc_ps[i] = (long[])abc_ps_1[i].Clone();
+            }
+            abc_ps[0] = (long[])abc_ps_1[abc_ps.Length].Clone();
+            //r -= 5;
+            //R -= 5;
+
+            //r = 40;
+
+
+            var j_max = 120;
+            var k_max = 120;
+
+            var da = kd * 0.03;
+            var db = kd * 0.03;
+            Console.WriteLine("ab_st: " + a_off + " " + b_off);
+            a_off -= da* j_max/2;
+            b_off -= db * k_max / 2;
+            var a_off_start = a_off;
+            var b_off_start = b_off;
+            var im = new Image<Gray, double>(j_max, k_max);           
+            var err_min = 1111110d;
+
+            var a_off_solv = 0d;
+            var b_off_solv = 0d;
+
+
+            var max_print_r = max_printing_radius();
+            comp_delta_table(max_print_r);
+            var err = estimate_flat_err(abc_ps);
+
+            for (int j = 0; j < j_max; j++)
+            {
+                a_off = a_off_start;
+                for (int k = 0;k < k_max; k++)
+                {
+                    a_off += da;
+
+                    max_print_r = max_printing_radius();
+                    comp_delta_table(max_print_r);
+                    err = estimate_flat_err(abc_ps);
+                    //Console.WriteLine(a_off+" "+b_off+" "+r+" "+  err);
+                    //if(err<0.7) 
+                    if(err<err_min)
+                    {
+                        err_min  = err;
+                        a_off_solv = a_off;
+                        b_off_solv = b_off;
+                        Console.WriteLine(err + " " + a_off + " " + b_off + " " + r);
+                    }
+                    
+                    im.Data[k, j, 0] = err;
+                       // Console.WriteLine(err+" "+ a_off + " " + b_off + " " + r);
+                }
+                b_off += db;
+            }
+
+            
+            
+
+            var im2 = new Image<Bgr, byte>(j_max, k_max);
+            for (int j = 0; j < j_max; j++)
+            {
+                for (int k = 0; k < k_max; k++)
+                {
+                    err = im.Data[k, j, 0] - err_min;
+                    err *= 200000;
+                    if (err > 255) err = 255;
+                    im2.Data[k, j, 0] = (byte)err;
+                }
+            }
+            CvInvoke.Imshow("im1_ab", im2);
+            CvInvoke.WaitKey();
+
+            a_off = a_off_solv;
+            b_off = b_off_solv;
+            var dl = kd * 0.5;
+            var dr = kd * 0.5;
+            var dR = kd * 0.5;
+            //l -= dl * j_max / 2;
+            l -= dl * j_max / 2;
+            R -= dR * k_max / 2;
+            var l_start = l;
+            var r_start = r;
+            var R_start = R;
+            var im3 = new Image<Gray, double>(j_max, k_max);
+            err_min = 1111110d;
+
+
+            var l_solve = l;
+            var r_solve = r;
+            var R_solve = R;
+
+            for (int j = 0; j < j_max; j++)
+            {
+                l = l_start;
+                //r = r_start;
+                for (int k = 0; k < k_max; k++)
+                {
+                    //r += dr;
+                    l += dl;
+                    max_print_r = max_printing_radius();
+                    comp_delta_table(max_print_r);
+                    err = estimate_flat_err(abc_ps);
+                    //Console.WriteLine(a_off+" "+b_off+" "+r+" "+  err);
+                    //if(err<0.7) 
+                    if (err < err_min)
+                    {
+                        err_min = err;
+                        l_solve = l;
+                        //r_solve = r;
+                        R_solve = R;
+                    }
+
+                    im3.Data[k, j, 0] = err;
+                    // Console.WriteLine(err+" "+ a_off + " " + b_off + " " + r);
+                }
+                R += dR;
+            }
+            l = l_solve;
+            R = R_solve;
+            model_3d = true;
+            max_print_r = max_printing_radius();
+            comp_delta_table(max_print_r);
+            err = estimate_flat_err(abc_ps);
+            Console.WriteLine("err: " + err_min +" "+a_off+" "+b_off+" "+r+" "+R + " " +l );
+
+            im2= new Image<Bgr,byte>(j_max, k_max);
+            for (int j = 0; j < j_max; j++)
+            {
+                for (int k = 0; k < k_max; k++)
+                {
+                    err = im3.Data[k, j,0]- err_min;
+                    err *= 200000;
+                    if (err > 255) err = 255;
+                    im2.Data[k, j, 0] =(byte) err;
+                }
+            }
+            CvInvoke.Imshow("im1_lr", im2);
+            CvInvoke.WaitKey();
+            //delta_comp_test(0.5 * iter_cur, iter_cur);
+            
+                
+        }
+        bool model_3d = false;
+        double estimate_flat_err(long[][] ps_abc)
+        {
+            var ps_xyz = new Point3d_GL[ps_abc.Length];
+            for (int i = 0; i < ps_abc.Length; i++)
+            {
+                ps_xyz[i] = solve_fk(ps_abc[i]).p_xyz;
+            }
+            if(model_3d)
+            {
+                var pols = new List<Polygon3d_GL>();
+                for(int i=0; i < 7;i++)
+                {
+                    var pol = new Polygon3d_GL(ps_xyz[0], ps_xyz[i+8], ps_xyz[i + 9]);
+                    pols.Add(pol);
+                }
+                var pol1 = new Polygon3d_GL(ps_xyz[0], ps_xyz[15], ps_xyz[8]);
+                pols.Add(pol1);
+
+                for (int i = 0; i < 7; i++)
+                {
+                    var pol2 = new Polygon3d_GL(ps_xyz[i + 1], ps_xyz[i + 9], ps_xyz[i + 8]);
+                    pols.Add(pol2);
+
+                    var pol3 = new Polygon3d_GL(ps_xyz[i + 1], ps_xyz[i + 2], ps_xyz[i + 9]);
+                    pols.Add(pol3);
+                }
+                var pol4 = new Polygon3d_GL(ps_xyz[7], ps_xyz[8], ps_xyz[15]);
+                pols.Add(pol4);
+
+                var pol5 = new Polygon3d_GL(ps_xyz[7], ps_xyz[1], ps_xyz[8]);
+                pols.Add(pol5);
+
+                saveMesh(Polygon3d_GL.toMesh(pols.ToArray())[0], "test_delta");
+                model_3d = false;
+
+                for (int i = 0; i < ps_xyz.Length; i++)
+                {
+                    Console.Write(Math.Round( ps_xyz[i].z,2)+" ");
+                }
+                Console.WriteLine();
+            }
+
+            
+
+            var flat = Point3d_GL.FitPlane_z(ps_xyz);
+            
+
+            //Console.WriteLine(flat.ToString());
+            var err = Math.Sqrt( Point3d_GL.errPlane(ps_xyz, flat));
+            return err;
+        }
+
+        public static void saveMesh(float[] mesh, string name)
+        {
+            var sb = new StringBuilder();
+            //string text = "solid\n";
+            sb.Append("solid\n");
+            for (int i = 0; i < mesh.Length; i += 9)
+            {
+                var text1 = "";
+                var p1 = new Point3d_GL(mesh[i], mesh[i + 1], mesh[i + 2]);
+                var p2 = new Point3d_GL(mesh[i + 3], mesh[i + 4], mesh[i + 5]);
+                var p3 = new Point3d_GL(mesh[i + 6], mesh[i + 7], mesh[i + 8]);
+                var U = p1 - p2;
+                var V = p1 - p3;
+                var Norm = new Point3d_GL(
+                    U.y * V.z - U.z * V.y,
+                    U.z * V.x - U.x * V.z,
+                    U.x * V.y - U.y * V.x);
+                var Norm1 = Norm.normalize();
+                text1 += "facet normal " + Norm1.x + " " + Norm1.y + " " + Norm1.z + "\n";
+                text1 += "outer loop\n";
+                text1 += "vertex " + mesh[i] + " " + mesh[i + 1] + " " + mesh[i + 2] + "\n";
+                text1 += "vertex " + mesh[i + 3] + " " + mesh[i + 4] + " " + mesh[i + 5] + "\n";
+                text1 += "vertex " + mesh[i + 6] + " " + mesh[i + 7] + " " + mesh[i + 8] + "\n";
+                text1 += "endloop\n";
+                text1 += "endfacet \n";
+                //text += text1;
+                sb.Append(text1);
+
+
+            }
+            GC.Collect();
+            sb.Append("endsolid\n");
+
+            Console.WriteLine("startWRITE");
+            if (!name.Contains('.'))
+            {
+                name += ".stl";
+            }
+            var wr = new StreamWriter(name);
+            wr.Write(sb);
+            Console.WriteLine("stopWRITE");
+            wr.Close();
+
+        }
+        public Point3d_GL delta_ik(Point3d_GL p)
+        {
+            
+            var p_a_cent = p + p_a_cent_off;
+            var p_b_cent = p + p_b_cent_off;
+            var p_c_cent = p + p_c_cent_off;
+
+            var a_z = cross_tower(p_a_cent, p_a_tower,l);
+            var b_z = cross_tower(p_b_cent, p_b_tower, l);
+            var c_z = cross_tower(p_c_cent, p_c_tower, l);
+
+            return new Point3d_GL(a_z + a_off,b_z + b_off, c_z);
+        }
+
+        static public double cross_tower(Point3d_GL p_c, Point3d_GL p_tower, double l)
+        {
+            p_tower = p_tower - p_c;
+            var r_xy = p_tower.magnitude_xy();
+            if (r_xy >= l) return -1;
+            var dz = Math.Sqrt(l*l-r_xy*r_xy);
+
+            return p_c.z+dz;
+        }
+
+        
+        public StepperFrame solve_fk(long[] pos)
+        {
+            var pos_comp = (long[])pos.Clone();
+            var p_xyz_fk = new Point3d_GL(0,0,0);
+
+
+
+
+            var a_z = pos[0] / p_xyz_steps.x;
+            var b_z = pos[1] / p_xyz_steps.y;
+            var c_z = pos[2] / p_xyz_steps.z;
+            var dest_abc = new Point3d_GL(a_z, b_z, c_z);
+            var p_start = comp_delta_fk_table(dest_abc);
+            var p_fit = comp_delta_fitting(p_start, dest_abc);
+            var p_fit2 = comp_delta_fitting(p_fit[1], dest_abc);
+            var p_fit3 = comp_delta_fitting(p_fit2[1], dest_abc);
+            var p_fit4 = comp_delta_fitting(p_fit3[1], dest_abc);
+            
+            var e_fk = e_steps / e_steps;
+            if (pos.Length>3)
+            {
+                e_fk = pos[3] / e_steps;
+            }
+
+                return new StepperFrame(p_fit4[1], e_fk, 0);
+        }
+       
+
+        public double max_printing_radius(double offs = 1)
+        {
+
+            printing_r = r + l - R - offs;
+            return printing_r;
+        }
+
+        public double[,,] delta_fk_table = new double[1000, 1000, 5];
+        static int fk_table_dim_1 = 15;
+        public double[,,] delta_fk_table_ps = new double[fk_table_dim_1, fk_table_dim_1, 5];
+        public double delta_fk_table_k = 1;
+        public void comp_delta_table(double printing_radius)
+        {
+            init_delta_comp();
+            var dxy = printing_radius / 10;
+            delta_fk_table = new double[2*(int)l, 2 * (int)l, 5];
+            delta_fk_table_k = (fk_table_dim_1 / (2 * l));
+            for (double x = -printing_radius; x<printing_radius; x+=dxy)
+            {
+                for (double y = -printing_radius; y < printing_radius; y += dxy)
+                {
+                    double z = 0;
+                    //for (double z = -printing_radius; z < printing_radius; z += dz)
+                    {
+                        if(Math.Sqrt(x*x+y*y)<printing_radius)
+                        {
+                            var p_z = delta_ik(new Point3d_GL(x,y,z));
+
+                            var a_z = p_z.x;
+                            var b_z = p_z.y;
+                            var c_z = p_z.z;
+                            var a_z_sh = (int)(delta_fk_table_k * ((a_z - c_z) + l));
+                            var b_z_sh = (int)(delta_fk_table_k * ((b_z - c_z) + l));
+                            //Console.WriteLine(a_z_sh+ " "+ b_z_sh);
+
+
+                            if (a_z_sh >= 0 && a_z_sh < delta_fk_table_ps.GetLength(0) && b_z_sh >= 0 && b_z_sh < delta_fk_table_ps.GetLength(1))
+                            {
+                                delta_fk_table_ps[a_z_sh, b_z_sh, 0] = x;
+                                delta_fk_table_ps[a_z_sh, b_z_sh, 1] = y;
+                                delta_fk_table_ps[a_z_sh, b_z_sh, 2] = z - p_z.z;
+
+                                delta_fk_table_ps[a_z_sh, b_z_sh, 3] = p_z.x - p_z.z;
+                                delta_fk_table_ps[a_z_sh, b_z_sh, 4] = p_z.y - p_z.z;
+
+                            }
+                        }
+                    }
+                }
+                
+            }
+            //Console.WriteLine("");
+        }
+
+        public Point3d_GL comp_delta_fk_table(Point3d_GL p_z)
+        {
+            var a_z = p_z.x;
+            var b_z = p_z.y;
+            var c_z = p_z.z;
+            var a_z_sh = (int)(delta_fk_table_k * ((a_z - c_z) + l));
+            var b_z_sh = (int)(delta_fk_table_k * ((b_z - c_z) + l));
+
+            if(a_z_sh< delta_fk_table_ps.GetLength(0) && b_z_sh < delta_fk_table_ps.GetLength(1)  && a_z_sh>= 0 && b_z_sh >= 0)
+            {
+                var x_0 = delta_fk_table_ps[a_z_sh, b_z_sh, 0];
+                var y_0 = delta_fk_table_ps[a_z_sh, b_z_sh, 1];
+                var z_0 = delta_fk_table_ps[a_z_sh, b_z_sh, 2];
+
+                z_0 += c_z;
+                return new Point3d_GL(x_0, y_0, z_0);
+            }
+            else
+            {
+                return new Point3d_GL(c_z, c_z, c_z);
+            }
+        }
+
+        public Point3d_GL[] comp_delta_fitting(Point3d_GL p_cur_xyz, Point3d_GL p_dest_abc, double dr = 0.001)
+        {
+            //Console.WriteLine("p_st: " + p_cur_xyz);
+            var p_0 = delta_ik(p_cur_xyz);
+            var dx = new Point3d_GL(dr, 0, 0); var dy = new Point3d_GL(0,dr,  0); var dz = new Point3d_GL( 0, 0,dr);
+            var p_dx = delta_ik(p_cur_xyz+dx); var p_dy = delta_ik(p_cur_xyz + dy); var p_dz = delta_ik(p_cur_xyz + dz);
+
+
+            var pds = new Point3d_GL[] { p_dx, p_dy, p_dz };
+            var arr_base = new double[3, 3];
+            var arr_err = new double[3, 1];
+            arr_err[0, 0] = p_dest_abc.x - p_0.x ;
+            arr_err[1, 0] = p_dest_abc.y - p_0.y;
+            arr_err[2, 0] = p_dest_abc.z - p_0.z;
+
+            for (int i = 0; i < 3; i++)
+            {
+                arr_base[0, i] = p_0.x - pds[i].x;
+                arr_base[1, i] = p_0.y - pds[i].y;
+                arr_base[2, i] = p_0.z - pds[i].z;
+            }
+
+            var m_base = new Matrix<double>(arr_base);
+            var m_err = new Matrix<double>(arr_err);
+            var X = new Matrix<double>(3, 1);
+            bool isSuccess = CvInvoke.Solve(m_base, m_err, X, DecompMethod.LU);
+
+
+            p_cur_xyz.x -= dr * X[0, 0];
+            p_cur_xyz.y -= dr * X[1, 0];
+            p_cur_xyz.z -= dr * X[2, 0];
+            //Console.WriteLine("p_fit: " + p_cur_xyz);
+            var abc_fitting = delta_ik(p_cur_xyz);
+
+            //Console.WriteLine(abc_fitting - p_dest_abc);
+
+            return new Point3d_GL[] { abc_fitting, p_cur_xyz };
+        }
+
+        static public StepperFrame[] gen_change_prog(int val, SettingsString settins_string, StepperFrame cur_frame,double safe_z)
+        {
+            StepperFrame[] prog_cur = null;
+
+            switch (val)
+            {
+                case 0:
+                    prog_cur = gen_take_prog(cur_frame, 10d, 4, 3,   //set take change left
+                settins_string.take_left_manip_vert,
+                settins_string.take_left_manip_rot,
+                settins_string.take_left_manip_x,
+                settins_string.take_left_manip_y,
+                settins_string.take_left_manip_z, safe_z
+                ); break;
+
+                case 1:
+                    prog_cur = gen_give_prog(cur_frame, 10d, 4, 3,   //set give change left
+                settins_string.take_left_manip_vert,
+                settins_string.take_left_manip_rot,
+                settins_string.take_left_manip_x,
+                settins_string.take_left_manip_y,
+                settins_string.take_left_manip_z, safe_z
+                ); break;
+
+                case 2:
+                    prog_cur = gen_take_prog(cur_frame, 10d, 6, 5,    //set take change right
+                settins_string.take_right_manip_vert,
+                settins_string.take_right_manip_rot,
+                settins_string.take_right_manip_x,
+                settins_string.take_right_manip_y,
+                settins_string.take_right_manip_z, safe_z
+                ); break;
+
+                case 3:
+                    prog_cur = gen_give_prog(cur_frame, 10d, 6, 5,    //set give change right
+                settins_string.take_right_manip_vert,
+                settins_string.take_right_manip_rot,
+                settins_string.take_right_manip_x,
+                settins_string.take_right_manip_y,
+                settins_string.take_right_manip_z, safe_z
+                ); break;
+            }
+
+            return prog_cur;
+        }
+        
+
+        static public StepperFrame[] gen_take_prog(StepperFrame cur_frame, double vel_change, int rot_ind, int vert_ind, int[] take_manip_vert, int[] take_manip_rot, double[] take_manip_x, double[] take_manip_y, double[] take_manip_z,double safe_z)
+        {
+            
+            var prog_cur = new List<StepperFrame>();
+            //prog_cur.Add(new StepperFrame(2, 587, "I"+ rot_ind + " H", false));
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ vert_ind + " P" + take_manip_vert[0] + " L", false));
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ rot_ind + " P" + take_manip_rot[0] + " L", false));
+
+
+            var cur = cur_frame.clone();
+            cur.vel = vel_change;
+            prog_cur.Add(cur.clone());
+            /*if (cur.p_xyz.z < safe_z)
+            {
+                cur.p_xyz.z = safe_z;
+                prog_cur.Add(cur);
+            }*/
+            
+
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[0], take_manip_y[0], take_manip_z[0]), 0, vel_change));
+
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ rot_ind + " P" + take_manip_rot[1] + " L", false));
+
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[0], take_manip_y[0], take_manip_z[0]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[1], take_manip_y[1], take_manip_z[1]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[2], take_manip_y[2], take_manip_z[2]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ rot_ind + " P" + take_manip_rot[2] + " L", false));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[2], take_manip_y[2],take_manip_z[2]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[3], take_manip_y[3], take_manip_z[3]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[4], take_manip_y[4], take_manip_z[4]), 0, vel_change));
+
+
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ rot_ind + " P" + take_manip_rot[3] + " L", false));
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ vert_ind + " P" + take_manip_vert[1] + " L", false));
+
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[4], take_manip_y[4], take_manip_z[4]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[5], take_manip_y[5], take_manip_z[5]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[6], take_manip_y[6], take_manip_z[6]), 0, vel_change));
+
+
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[6], take_manip_y[6], take_manip_z[6]), 0, vel_change));
+
+            prog_cur.Add(new StepperFrame(2, 587, "I" + rot_ind + " P" + take_manip_rot[4] + " L", false));
+            prog_cur.Add(new StepperFrame(2, 587, "I" + vert_ind + " P" + take_manip_vert[2] + " L", false));
+            return prog_cur.ToArray();
+        }
+
+
+        static public StepperFrame[] gen_give_prog(StepperFrame cur_frame, double vel_change, int rot_ind, int vert_ind, int[] take_manip_vert, int[] take_manip_rot, double[] take_manip_x, double[] take_manip_y, double[] take_manip_z, double safe_z)
+        {
+
+            var prog_cur = new List<StepperFrame>();
+            var cur = cur_frame.clone();
+            cur.vel = vel_change;
+            prog_cur.Add(cur.clone());
+            /*if (cur.p_xyz.z < safe_z)
+            {
+                cur.p_xyz.z = safe_z;
+                prog_cur.Add(cur);
+            }*/
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[6], take_manip_y[6], take_manip_z[6]), 0, vel_change));
+            //prog_cur.Add(new StepperFrame(2, 587, "I"+ rot_ind + " H", false));
+
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ rot_ind + " P" + take_manip_rot[3] + " L", false));
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ vert_ind + " P" + take_manip_vert[1] + " L", false));
+
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[6], take_manip_y[6], take_manip_z[6]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[5], take_manip_y[5], take_manip_z[5]), 0, vel_change));
+
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ vert_ind + " P" + take_manip_vert[0] + " L", false));
+
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[5], take_manip_y[5], take_manip_z[5]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[4], take_manip_y[4], take_manip_z[4]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ rot_ind + " P" + take_manip_rot[2] + " L", false));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[4], take_manip_y[4], take_manip_z[4]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[3], take_manip_y[3], take_manip_z[3]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[2], take_manip_y[2], take_manip_z[2]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ rot_ind + " P" + take_manip_rot[1] + " L", false));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[2], take_manip_y[2], take_manip_z[2]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[1], take_manip_y[1], take_manip_z[1]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[0], take_manip_y[0], take_manip_z[0]), 0, vel_change));
+            prog_cur.Add(new StepperFrame(2, 587, "I"+ rot_ind + " P" + take_manip_rot[4] + " L", false));
+            prog_cur.Add(new StepperFrame(2, 587, "I" + vert_ind + " P" + take_manip_vert[2] + " L", false));
+            prog_cur.Add(new StepperFrame(new Point3d_GL(take_manip_x[0], take_manip_y[0], take_manip_z[0]), 0, vel_change));
+            //prog_cur.Add(new StepperFrame(2, 587, "I" + rot_ind + " P100 L", false));//without double not work
+            return prog_cur.ToArray();
+        }
+
+
+    }
+    public class StepperLine
+    {
+       
+
+        public enum LineType { line, arc };
+        public LineType stepType;
+        public double vel = 1;
+        public double acs = 1;
+        public double e_width1 = 0;
+        public double e_width2 = 0;
+        public double r = 0;
+
+        public double vel_begin = 1;
+        public double vel_end = 1;
+        public Point3d_GL p_begin = new Point3d_GL(0, 0, 0);
+        public Point3d_GL p_end = new Point3d_GL(0, 0, 0);
+        public StepperFrame[] frms = null;
+
+
+        public StepperLine (Point3d_GL p_begin, Point3d_GL p_end, double vel, double acs, double vel_begin, double vel_end, double e_width1)
+        {
+            this.stepType = LineType.line;
+            this.vel = vel;
+            this.acs = acs;
+            this.vel_begin = vel_begin;
+            this.vel_end = vel_end;
+            this.p_begin = p_begin;
+            this.p_end = p_end;
+            this.e_width1 = e_width1;
+            
+            var line = gen_ps_line(p_begin, p_end, StepperPrinter.min_dist);
+            this.frms = comp_frms_line(line);
+        }
+        public StepperLine(Point3d_GL p_begin, Point3d_GL p_c, Point3d_GL p_end, double vel, double acs, double vel_begin, double vel_end, double e_width1, double e_width2, double r)
+        {
+            this.stepType = LineType.arc;
+            this.vel = vel;
+            this.acs = acs;
+            this.vel_begin = vel_begin;
+            this.vel_end = vel_end;
+            this.p_begin = p_begin;
+            this.p_end = p_end;
+            this.r = r;
+            this.e_width1 = e_width1;
+            this.e_width2 = e_width2;
+            //Console.WriteLine("arc--------------");
+            var arc = gen_ps_arc(p_begin, p_c, p_end, r, StepperPrinter.min_dist);
+            if (arc == null) this.frms = null;
+            else
+            {
+                this.frms = comp_frms_arc(arc);
+            }
+            //Console.WriteLine("end--------------");
+        }
+
+        public StepperFrame[] comp_frms_line(Point3d_GL[] ps)
+        {
+            var frames = new StepperFrame[ps.Length];
+
+            frames[0] = new StepperFrame(ps[0],0, vel);
+            for (int i=1; i<ps.Length;i++)
+            {
+                var r = (ps[i] - ps[i-1]).magnitude();
+                frames[i] = new StepperFrame(ps[i], r*e_width1, vel,0,e_width1);
+            }
+
+            return frames;
+        }
+
+        public StepperFrame[] comp_frms_arc(Point3d_GL[] ps)
+        {
+            var frames = new StepperFrame[ps.Length];
+            var de = (e_width2 - e_width1)/ps.Length;
+            var dv = (vel_end - vel_begin)/ps.Length;
+
+            frames[0] = new StepperFrame(ps[0], 0, vel);
+            var e_w_cur = e_width1;
+            var v_cur = vel_begin;
+            for (int i = 1; i < ps.Length; i++)
+            {
+                e_w_cur += de;
+                v_cur += dv;
+                var r = (ps[i] - ps[i - 1]).magnitude();
+                frames[i] = new StepperFrame(ps[i], r * e_w_cur, v_cur, 0, e_w_cur);
+                if(!double.IsNormal(r))
+                {
+                   // Console.WriteLine(frames[i].e + " " + r + " " + e_w_cur + " " + ps[i] + "; " + ps[i - 1]);
+                }
+                
+            }
+
+            return frames;
+        }
+
+        static double cos(double ang)
+        {
+            return Math.Cos(ang);
+        }
+        static double sin(double ang)
+        {
+            return Math.Sin(ang);
+        }
+        static double pi = 3.1415926535;
+
+        public static Point3d_GL[] gen_ps_line(Point3d_GL p1, Point3d_GL p2, double min_dist)
+        {
+            var ps = new List<Point3d_GL>();
+
+            ps.Add(p1);
+            var r = (p2 - p1).magnitude();
+            if(r < 2* min_dist) { ps.Add(p2); return ps.ToArray(); }
+            var len = ( r/ min_dist);
+
+            var dp = (p2 - p1) / len;
+
+            for(int i = 0; i < len-1;i++)
+            {
+                ps.Add(p1+dp*i);
+            }
+
+            ps.Add(p2);
+
+
+            /*Console.WriteLine("line_ps_________________");
+            for (int i = 0; i < ps.Count; i++)
+            {
+                //if (!double.IsNormal(ps[i].x) || !double.IsNormal(ps[i].y) || !double.IsNormal(ps[i].z))
+                {
+                    Console.WriteLine(ps[i] + "; p1: " + p1 + "; p2: " + p2);
+                }
+            }*/
+
+
+            return ps.ToArray();
+        }
+        public static Point3d_GL[] gen_ps_arc(Point3d_GL p1, Point3d_GL p2, Point3d_GL p3, double r, double min_dist)
+        {
+            var v1 = p1 - p2;
+            var v2 = p3 - p2;
+
+
+
+            var dist1 = v1.magnitude();
+            var dist2 = v2.magnitude();
+
+            if (r > dist1 || r > dist2)
+            {
+                //Console.WriteLine("2 * d2 > v2.magnitude() || 2 * d2 > v1.magnitude()"+ 2 * d2+" " + v2.magnitude() + " " + v1.magnitude() + " ");
+                return null;
+            }
+
+            var v1_n = v1.normalize();
+            var v2_n = v2.normalize();
+            var vc_n = ((v1_n + v2_n) / 2).normalize();
+            var alpha = Point3d_GL.ang(v1_n, v2_n) / 2;
+            if (Math.Sin(alpha) < 0.001) { 
+                //Console.WriteLine("Math.Sin(alpha) < 0.001"); 
+                return null; 
+            }
+            var d1 = r / Math.Sin(alpha);
+            var d2 = r / Math.Tan(alpha);
+            var p3_c = p2 + vc_n * d1;
+            var p1_c = p2 + v1 * d2;
+            var p2_c = p2 + v2 * d2;
+
+            if (2 * d2 > dist1 || 2 * d2 > dist2) {
+                //Console.WriteLine("2 * d2 > v2.magnitude() || 2 * d2 > v1.magnitude()"+ 2 * d2+" " + v2.magnitude() + " " + v1.magnitude() + " ");
+                return null; 
+            }
+
+            if (d1 > 1.5 * r) { 
+                //Console.WriteLine("d1 > 1.5 * r");
+                return null; 
+            }
+            //----------------------------------
+            var v_beg = p1_c - p3_c;
+            var v_end = p2_c - p3_c;
+            var ps = new List<Point3d_GL>();
+            var alph = Point3d_GL.ang(v_beg, v_end);
+            var min_alph = min_dist / r;
+            var delim = (int)(alph / min_alph);
+            ps.Add(p1_c);
+            var v_beg_n = v_beg.normalize();
+            var v_end_n = v_end.normalize();
+            for (int i = 1; i < delim; i++)
+            {
+                var fi = (i / (double)delim) * (pi / 2);
+                var v_med = (v_beg_n * cos(fi) + v_end_n * sin(fi)).normalize() * r;
+                var cur_p = p3_c + v_med;
+                ps.Add(cur_p);
+                
+            }
+            ps.Add(p2_c);
+
+            /*Console.WriteLine("arc_ps_________________");
+            for(int i=0; i<ps.Count;i++)
+            {
+                //if (!double.IsNormal(ps[i].x) || !double.IsNormal(ps[i].y) || !double.IsNormal(ps[i].z))
+                {
+                    Console.WriteLine(ps[i]+"; p1: "+p1+ "; p2: " + p2 + "; p3: " + p3 );
+                }
+            }*/
+            return ps.ToArray();
+        }
+
+
+        public StepperLine comp_vel()
+        {
+            if (frms == null) return null;
+            if (frms.Length == 0) return null;
+            if (stepType == LineType.line)
+            {
+                var r_cur = 0d;
+                frms[0].vel = vel_begin;
+
+                for (int i = 1; i < frms.Length; i++)
+                {
+                    
+                    var dr = (frms[i].p_xyz - frms[i - 1].p_xyz).magnitude();
+                    r_cur += dr;
+                    var D = vel_begin * vel_begin + 2 * acs * r_cur;
+                    var t = (-vel_begin + Math.Sqrt(D)) / acs;
+                    var vel_cur = vel_begin + acs * t;
+
+                    
+
+                    if (vel_cur < frms[i].vel)
+                    {
+                        frms[i].vel = vel_cur;
+                    }
+                     //Console.WriteLine(", r_cur:" + r_cur + ", t:" + t +", frms[i].vel :" + frms[i].vel);
+                }
+
+                r_cur = 0d;
+                frms[frms.Length-1].vel = vel_end;
+                
+                for (int i = frms.Length-2; i >= 0  ; i--)
+                {
+                   // Console.WriteLine(frms[i].vel);
+                    
+                    var dr = (frms[i].p_xyz - frms[i + 1].p_xyz).magnitude();
+                    r_cur += dr;
+                    var D = vel_end * vel_end + 2 * acs * r_cur;
+                    var t = (-vel_end + Math.Sqrt(D)) / acs;
+                    var vel_cur = vel_end + acs * t;
+                    if(vel_cur < frms[i].vel)
+                    {
+                        frms[i+1].vel = vel_cur;
+
+                    }
+
+                    //frms[frms.Length - 1].vel = (frms[frms.Length - 2].vel + StepperLine.min_vel)/2;
+                     //Console.WriteLine(", r_cur:" + r_cur + ", t:" + t +", frms[i].vel :" + frms[i].vel);
+                }
+
+            }
+            else
+            {
+                var vel_cur = vel_begin;
+                var dv = (vel_end - vel_begin)/frms.Length;
+                for( int i = 0; i < frms.Length; i++)
+                {
+                    frms[i].vel = vel_cur;
+                    vel_cur += dv;
+                }
+            }
+            return this;
+        }
+
+    }
+
+    public class StepperFrame
+    {
+
+        public Point3d_GL p_xyz;   //  mm
+        public double e;   //  mm
+        public double time_abs = 100000;  //  sec
+        public double vel;         //  mm/sec
+        public double e_width;  
+        
+        public int plate_num;
+        public int com_num;
+        public string body = "";
+
+        public bool kinematic = true;
+        public bool movement = true;
+
+        public int len = -1;
+        public int prog_number = 0;
+        public int line_number = 0;
+
+
+        public int consider_wait_all_steps_kinem = 0;
+        public int consider_all_steps1 = 0;
+        public int consider_all_steps2 = 0;
+        public int consider_prog_done = 0;
+        public int consider_wait_en = 0;
+        public int consider_wait_term = 0;
+
+        public bool reset_extr = false;
+
+        public long[] poses = new long[5];
+
+        public bool poses_have = false;
+
+        
+
+
+        /*public StepperFrame(RobotFrame _frame, double _time)
+        {
+            frame = _frame;
+            time = _time;
+        }*/
+
+        public StepperFrame(Point3d_GL _p_xyz, double _e, double _vel, double time = 0,double e_width = 0)
+        {
+            p_xyz = _p_xyz;
+            e = _e;
+            vel = _vel;
+            time_abs = time;
+            this.e_width = e_width;
+            plate_num = 1;
+            com_num = 588;
+            kinematic = true;
+            movement = true;
+            
+        }
+
+        public StepperFrame(int plate_num, int com_num, string body, bool kinematic = false, int wait = 1)
+        {
+            this.plate_num = plate_num;
+            this.com_num = com_num;
+            this.body = body;
+            this.kinematic = kinematic;
+            movement = false;
+
+            if(!kinematic)
+            {
+                if (plate_num == 1) consider_all_steps1 = wait;
+                if (plate_num == 2) consider_all_steps2 = wait;
+            }
+
+            if(com_num == 589 && body.Contains('P'))
+            {
+                consider_wait_en = wait;
+            }
+            if (com_num == 579)
+            {
+                consider_wait_term = wait;
+            }
+        }
+
+        public StepperFrame(int consider_wait_all_steps_kinem = 0, int consider_all_steps1 = 0, int consider_all_steps2 = 0, int consider_prog_done = 0, int consider_wait_en = 0, int consider_wait_term = 0)
+        {
+            this.plate_num = 0;
+            this.com_num = 701;
+            this.body = "";
+            this.kinematic = false;
+            movement = false;
+
+
+            this.consider_wait_all_steps_kinem = consider_wait_all_steps_kinem;
+            this.consider_all_steps1 = consider_all_steps1;
+            this.consider_all_steps2 = consider_all_steps2;
+            this.consider_prog_done = consider_prog_done;
+            this.consider_wait_en = consider_wait_en;
+            this.consider_wait_term = consider_wait_term;
+        }
+
+        public string get_command(StepperPrinter printer)
+        {
+
+            if(plate_num==0)
+            {
+                if (com_num == 701)
+                {
+                    var com = "main M" + com_num + " " + consider_wait_all_steps_kinem + " " + consider_all_steps1 + " " + consider_all_steps2 + " " + consider_prog_done + " " + consider_wait_en + " " + consider_wait_term;
+                    return com;
+                }
+                else
+                {
+                    var com = "main M" + com_num + " " + body;
+                    return com;
+                }
+                
+            }
+
+            if(kinematic && movement)
+            {
+
+                var cur_pos = printer.solve_ik(this);
+
+                printer.abs_pos_extr += printer.koef_extrus * e;
+                // Console.Write(cur_pos[3] + " " + cur_pos[3] * printer.koef_extrus+" ");
+                //cur_pos[3] =(long)( cur_pos[3] * printer.koef_extrus);
+                // Console.WriteLine(cur_pos[3]);
+                if (printer.koef_vel > 0.01)
+                {
+                    cur_pos[4] = (long)(cur_pos[4] / printer.koef_vel);
+                }
+                var com = "num" + plate_num + " M588 X" + cur_pos[0] + " Y" + cur_pos[1] + " Z" + cur_pos[2] + " E" + (long)(printer.abs_pos_extr * printer.e_steps) + " W" + cur_pos[4] + " I" + prog_number + " J" + line_number;
+                return com;
+
+
+                
+            }
+            else
+            {
+                var com = "num" + plate_num + " M" + com_num + " " + body;
+                return com;
+            }
+
+        }
+
+        public override string ToString()
+        {
+            return "plate_num: " + plate_num + "; com_num: "+com_num+"; xyz: "+ p_xyz+"; e: " + e +"; body:"+body;
+        }
+
+
+        static public StepperFrame[] comp_e_width(StepperFrame[] frms)
+        {
+            if (frms == null) return null;
+            if (frms.Length == 0) return null;
+            var frames_comp = new List<StepperFrame>();
+            frames_comp.Add(frms[0]);
+            for (int i = 1; i < frms.Length; i++)
+            {
+                var p1 = frms[i-1].p_xyz;
+                var e1 = frms[i-1].e;
+
+                var p2 = frms[i].p_xyz;
+                var e2 = frms[i].e;
+
+                var r = (p1 - p2).magnitude();
+
+                var frame = frms[i].clone();
+                if (r>0)
+                {
+                    var e_width =  (e2) / r;
+                    frame.e_width = e_width;
+                }
+
+
+                frames_comp.Add(frame);
+
+            }
+            return frames_comp.ToArray();
+        }
+
+        public StepperFrame clone()
+        {
+            return new StepperFrame(new Point3d_GL(p_xyz.x, p_xyz.y, p_xyz.z), e, vel, time_abs,e_width);
+        }
+        static public double calc_time(StepperFrame fr1, StepperFrame fr2)
+        {
+            var dist = (fr1.p_xyz-fr2.p_xyz).magnitude();
+            if(dist ==0) dist = Math.Abs (fr1.e - fr2.e);
+            if (fr2.vel == 0) return -1;
+            return dist / ((fr2.vel+fr1.vel)/2);
+        }
+        static public StepperFrame[] frame_divide(StepperFrame frame_prev, StepperFrame frame_cur, double min_dist = 0.1)
+        {
+            if (min_dist == 0) return null;
+            var dist = (frame_prev.p_xyz - frame_cur.p_xyz).magnitude();
+            if(dist==0) dist = Math.Abs(frame_prev.e - frame_cur.e);
+            var div_nums = (int)(dist / min_dist);
+            if (div_nums < 2) {
+                return new StepperFrame[] { frame_cur };
+            }
+            var d_dist = (frame_prev.p_xyz - frame_cur.p_xyz)/div_nums;
+            var d_e = (frame_prev.e - frame_cur.e) / div_nums;
+            var d_t = (frame_prev.time_abs - frame_cur.time_abs) / div_nums;
+
+            var frames = new List<StepperFrame>();
+            var p_xyz_stop = frame_cur.p_xyz;
+            var e_stop = frame_cur.e;
+            var t_stop = frame_cur.time_abs;
+            for( var i = div_nums-1; i > 0; i--)
+            {
+                var p_xyz_div = p_xyz_stop + d_dist * i;
+                var e_div = e_stop + d_e * i;
+                var t_div = t_stop + d_t * i;
+                frames.Add(new StepperFrame(p_xyz_div, e_div, frame_cur.vel, t_div));
+            }
+
+            frames.Add(frame_cur);
+
+            return frames.ToArray();
+        }
+
+        public static StepperFrame[] frames_calc_time(StepperFrame[] frames)
+        {
+            if (frames == null) return null;
+            if (frames.Length == 0) return null;
+            for (var i = 1; i < frames.Length; i++)
+            {
+                var dtime = calc_time(frames[i - 1], frames[i]);
+                if (dtime >= 0) frames[i].time_abs = dtime;
+                else Console.WriteLine("dtime < 0");
+            }
+
+            return frames;
+        }
+
+        public static StepperFrame[] comp_vel(StepperLine[] lines)
+        {
+            if (lines.Length == 0) return null;
+            lines[0].vel_begin = StepperPrinter.min_vel;
+            for (int i=1; i<lines.Length; i++)
+            {
+                if(lines[i].stepType == StepperLine.LineType.line && lines[i-1].stepType == StepperLine.LineType.line)
+                {
+                    lines[i].vel_begin = StepperPrinter.min_vel;
+                    lines[i - 1].vel_end = StepperPrinter.min_vel;
+                }
+
+
+                if(lines[i].stepType == StepperLine.LineType.arc && i!= lines.Length-1)
+                {
+                    var v_max = Math.Sqrt(lines[i].r * lines[i].acs);
+                    if(lines[i].vel_begin > v_max)
+                    {
+                        lines[i].vel_begin = v_max;
+                        lines[i - 1].vel_end = v_max;
+                    }
+                    if (lines[i].vel_end > v_max)
+                    {
+                        lines[i].vel_end = v_max;
+                        lines[i + 1].vel_begin = v_max;
+                    }
+                }
+            }
+            lines[lines.Length - 1].vel_end = StepperPrinter.min_vel;
+
+            //Console.WriteLine("__________comp_vel__________________"); 
+
+            for(int i=0; i<lines.Length; i++)
+            {
+               // Console.WriteLine(lines[i].vel_begin+" "+ lines[i].vel_end+" "+ lines[i].vel);
+                lines[i] = lines[i].comp_vel();
+            }
+
+            var frms = new List<StepperFrame>();
+            for(int i=0; i< lines.Length;i++)
+            {
+                frms.AddRange(lines[i].frms);
+            }
+
+            return frms.ToArray();
+        }
+
+
+        public static StepperFrame[] frames_smooth(StepperFrame[] frames,int wind)
+        {
+            if (frames == null) return null;
+            if (frames.Length == 0) return null;
+            var frames_smooth = new List<StepperFrame>();
+            var frames_orig = frames.ToList();
+            for (var i = 0; i < frames.Length; i++)
+            {
+                var i_min = i - wind; if(i_min < 0) i_min = 0;
+                var i_max = i + wind; if(i_max >= frames.Length) i_max = frames.Length-1;
+                var wind_real = i_max - i_min;
+                frames_smooth.Add(frame_aver(frames_orig.GetRange(i_min, wind_real).ToArray(), frames_orig[i]));
+            }
+
+            return frames_smooth.ToArray();
+        }
+
+
+        public static StepperFrame find_last_kinematic_frame(StepperFrame[] frames)
+        {
+            if (frames == null) return null;
+            if (frames.Length == 0) return null;
+            
+        
+            for (var i = frames.Length-1; i >=0; i--)
+            {
+                if (frames[i].kinematic && frames[i].movement && frames[i].com_num == 588) return frames[i].clone();
+            }
+
+            return null;
+        }
+
+
+        public static StepperFrame frame_aver(StepperFrame[] frames, StepperFrame frame_ref)
+        {
+            if (frames == null) return null;
+            if (frames.Length == 0) return null;
+            var frame_aver = new StepperFrame(new Point3d_GL(0, 0, 0), 0, 0, 0);
+
+            for (var i = 0; i < frames.Length; i++)
+            {
+                frame_aver.p_xyz += frames[i].p_xyz;
+                frame_aver.e += frames[i].e;
+            }
+
+            frame_aver.p_xyz /= frames.Length;
+            frame_aver.e /= frames.Length;
+            frame_aver.time_abs = frame_ref.time_abs;
+
+            return frame_aver;
+        }
+
+
+        public static StepperFrame[] frames_divide(StepperFrame[] frames, double min_dist = 0.1)
+        {
+            if (frames == null) return null;
+            if (frames.Length == 0) return null;
+            var frames_div = new List<StepperFrame>();
+            for( var i = 1; i<frames.Length; i++)
+            {
+                var div = frame_divide(frames[i-1], frames[i], min_dist);
+                if(div != null)  frames_div.AddRange(div);
+            }
+
+            return frames_div.ToArray();
+        }
+
+        public static StepperFrame frame_convert_to_steps(StepperFrame frame, Point3d_GL p_xyz_steps, double e_steps, double t_coef)
+        {
+            frame.p_xyz.x *= (int)p_xyz_steps.x;
+            frame.p_xyz.y *= (int)p_xyz_steps.y;
+            frame.p_xyz.z *= (int)p_xyz_steps.z;
+            frame.e       *= (int)e_steps;
+            frame.time_abs*= (int)t_coef;
+            return frame;
+        }
+
+        public static StepperFrame[] frames_convert_to_steps(StepperFrame[] frames, Point3d_GL p_xyz_steps, double e_steps, double t_coef)
+        {
+            if (frames == null) return null;
+            if (frames.Length == 0) return null;
+            var frames_conv = new List<StepperFrame>();
+            for (var i = 0; i < frames.Length; i++)
+            {
+                frames_conv.Add(frame_convert_to_steps(frames[i], p_xyz_steps,  e_steps, t_coef));                
+            }
+
+            return frames_conv.ToArray();
+        }
+        //mm*koef = steps
+        //sec*t_koef = count
+        public static StepperFrame[] convert_frames(StepperFrame[] frames, Point3d_GL p_xyz_steps, double e_steps, double t_coef, int wind = 5, double min_dist = 0.1)
+        {
+            if (frames == null) return null;
+            if (frames.Length == 0) return null;
+            
+            var frames_time = frames_calc_time(frames);
+            var frames_div = frames_divide(frames_time, min_dist);
+            var frames_sm = frames_smooth(frames_div, wind);
+
+            var frames_conv = frames_convert_to_steps(frames_sm, p_xyz_steps, e_steps, t_coef);
+            return frames_conv.ToArray();
+        }
+
+        public static StepperFrame[] convert_frames_v2(StepperFrame[] frames,  int wind = 5, double min_dist = 0.2)
+        {
+            if (frames == null) return null;
+            if (frames.Length == 0) return null;
+
+            var frames_time = frames_calc_time(frames);
+            var frames_div = frames_divide(frames_time, min_dist);
+            var frames_sm = frames_smooth(frames_div, wind);
+
+            //var frames_conv = frames_convert_to_steps(frames_sm, p_xyz_steps, e_steps, t_coef);
+            return frames_sm.ToArray();
+        }
+
+        public static StepperFrame[] filtr_dist(StepperFrame[] frames_in, double min_dist)
+        {
+            var ps_filtr = new List<StepperFrame>();
+            ps_filtr.Add(frames_in[0]);
+            bool last_added = false;
+            for(int i=1; i<frames_in.Length; i++)
+            {
+                var dist_cur = dist_betw_fr(ps_filtr[ps_filtr.Count-1], frames_in[i]);
+                if(dist_cur > min_dist)
+                {
+                    ps_filtr.Add(frames_in[i]);
+                    if(i == frames_in.Length - 1) last_added = true;
+                }
+            }
+            if(!last_added)
+            {
+                ps_filtr.RemoveAt(ps_filtr.Count-1);
+                ps_filtr.Add(frames_in[frames_in.Length - 1]);
+            }
+
+            return ps_filtr.ToArray();
+        }
+
+        public static StepperFrame[] filtr_time(StepperFrame[] frames_in, double min_time)
+        {
+            var ps_filtr = new List<StepperFrame>();
+            ps_filtr.Add(frames_in[0]);
+            bool last_added = false;
+            for (int i = 1; i < frames_in.Length; i++)
+            {
+                var dtime_cur = frames_in[i].time_abs - ps_filtr[ps_filtr.Count - 1].time_abs;
+                if (dtime_cur > min_time)
+                {
+                    ps_filtr.Add(frames_in[i]);
+                    if (i == frames_in.Length - 1) last_added = true;
+                }
+            }
+            if (!last_added)
+            {
+                ps_filtr.RemoveAt(ps_filtr.Count - 1);
+                ps_filtr.Add(frames_in[frames_in.Length - 1]);
+            }
+
+            return ps_filtr.ToArray();
+        }
+
+        public static double dist_betw_fr(StepperFrame fr1, StepperFrame fr2)
+        {
+            var dist = (fr1.p_xyz - fr2.p_xyz).magnitude();
+            if (dist == 0)
+            {
+                dist = Math.Abs(fr1.e - fr2.e);
+            }
+            return dist;
+            
+        }
+
+        public static StepperFrame[] e_to_abs(StepperFrame[] frames_in)
+        {
+            var cur_e = 0d;
+            for (int i = 0; i < frames_in.Length; i++)
+            {
+                cur_e += frames_in[i].e;
+                frames_in[i].e = cur_e;
+                
+            }
+            return frames_in;
+        }
+
+        public static StepperFrame[] e_to_rel(StepperFrame[] frames_in)
+        {
+            var frames_rel = new StepperFrame[frames_in.Length];
+            frames_rel[0] = frames_in[0].clone();
+            for (int i = 1; i < frames_in.Length; i++)
+            {
+               
+                frames_rel[i] = frames_in[i].clone();
+                var de = frames_in[i].e - frames_in[i - 1].e;                
+                frames_rel[i].e = de;
+                //Console.WriteLine(frames_rel[i].e);
+            }
+
+            return frames_rel;
+        }
+
+
+        public static StepperFrame[] time_to_abs(StepperFrame[] frames_in)
+        {
+            var cur_time = 0d;
+            for (int i = 0; i < frames_in.Length; i++)
+            {
+                cur_time += frames_in[i].time_abs;
+                frames_in[i].time_abs = cur_time;
+
+            }
+            return frames_in;
+        }
+
+        public static StepperFrame[] time_to_rel(StepperFrame[] frames_in)
+        {
+            var frames_rel = new StepperFrame[frames_in.Length];
+            frames_rel[0] = frames_in[0].clone();
+            for (int i = 1; i < frames_in.Length; i++)
+            {
+
+                frames_rel[i] = frames_in[i].clone();
+                var dtime = frames_in[i].time_abs - frames_in[i - 1].time_abs;
+                frames_rel[i].time_abs = dtime;
+            }
+
+            return frames_rel;
+        }
+
+
+        public static StepperFrame[] convert_frames_v3(StepperFrame[] frames_in, double acs,double r_max)
+        {
+            if (frames_in == null) return null;
+            if (frames_in.Length == 0) return null;
+            //Console.WriteLine("e_to_rel 1:");
+            frames_in = e_to_rel(frames_in);
+            StepperFrame[] frames = comp_e_width(frames_in);
+            //e rel
+            var step_lines = new List<StepperLine>();
+            var first_p = frames[0].p_xyz;
+            var last_type_line = StepperLine.LineType.line;
+            for (int i=1; i<frames.Length;i++)
+            {
+                if(i < frames.Length-1)
+                {
+                    var v_max = Math.Max(frames[i].vel, frames[i + 1].vel);
+                    var r_cur = v_max * v_max / acs;
+                    if (r_cur > r_max) r_cur = r_max;
+
+                    var arc = new StepperLine(frames[i - 1].p_xyz, frames[i].p_xyz, frames[i + 1].p_xyz, frames[i].vel, acs, frames[i].vel, frames[i + 1].vel, frames[i].e_width, frames[i + 1].e_width, r_cur);
+                    
+                    if (arc.frms != null)
+                    {
+                        //Console.WriteLine("arc: " + r_cur);
+
+                        if (last_type_line != StepperLine.LineType.arc)
+                        {
+                            //Console.WriteLine("step_lines[step_lines.Count-1]");
+                            first_p = frames[i - 1].p_xyz;
+                        }
+                        var line = new StepperLine(first_p, arc.frms[0].p_xyz, frames[i].vel, acs, frames[i - 1].vel, frames[i].vel, frames[i].e_width);
+                        step_lines.Add(line);
+                        step_lines.Add(arc);
+                        first_p = arc.frms[arc.frms.Length-1].p_xyz;
+                        last_type_line = StepperLine.LineType.arc;
+                    }
+                    else
+                    {
+                        if (last_type_line != StepperLine.LineType.arc)
+                        {
+                            //Console.WriteLine("step_lines[step_lines.Count-1]");
+                            first_p = frames[i - 1].p_xyz;
+                        }
+                        //Console.WriteLine(first_p);
+                        var line = new StepperLine(first_p, frames[i].p_xyz, frames[i].vel, acs, frames[i - 1].vel, frames[i].vel, frames[i].e_width);
+                        step_lines.Add(line);
+                        last_type_line = StepperLine.LineType.line;
+                    }
+                }
+                else
+                {
+                    if (last_type_line != StepperLine.LineType.arc)
+                    {
+                        //Console.WriteLine("step_lines[step_lines.Count-1]");
+                        first_p = frames[i - 1].p_xyz;
+                    }
+                    var line = new StepperLine(first_p, frames[i].p_xyz, frames[i].vel, acs, frames[i - 1].vel, frames[i].vel, frames[i].e_width);
+
+                   // var line = new StepperLine(first_p = frames[i - 1].p_xyz, frames[i].p_xyz, frames[i].vel, acs, frames[i - 1].vel, frames[i].vel, frames[i].e_width);
+                    step_lines.Add(line);
+                }
+            }
+
+            var frms = comp_vel(step_lines.ToArray()); if (frms == null)  return null;
+            var frames_time = frames_calc_time(frms.ToArray());
+            frms = e_to_abs(frms);
+            var frms_abs = time_to_abs(frms);
+            //PA
+            var filtr_ps = filtr_time(frms.ToArray(), StepperPrinter.min_time *0.001);
+            //Console.WriteLine("e_to_rel 2:");
+            filtr_ps = e_to_rel(filtr_ps);
+            frames_time = time_to_rel(filtr_ps);
+            
+            //Console.WriteLine("frames_time_________");
+            for(int i = 1; i < frames_time.Length; i++)
+            {
+                var dr = (frames_time[i].p_xyz - frames_time[i - 1].p_xyz).magnitude();
+                //Console.WriteLine(frames_time[i].time_abs + " " + frames_time[i].vel + " "+ frames_time[i].e);
+                //Console.WriteLine(i + " " + frames_time[i].vel + " " + frames_time[i].p_xyz.x);
+            }
+            //Console.WriteLine("_________");
+            //var frames_conv = frames_convert_to_steps(frames_sm, p_xyz_steps, e_steps, t_coef);
+            return frames_time.ToArray();
+        }
+
+        
+        
+        public static string[] test()
+        {
+            var fr0 = new StepperFrame(new Point3d_GL(0, 0, 0), 0, 10);
+            var fr1 = new StepperFrame(new Point3d_GL(10, 0, 0),  4,  10);
+            var fr2 = new StepperFrame(new Point3d_GL(20, 10,0),  8,  10);
+            var fr3 = new StepperFrame(new Point3d_GL(30, 0, 0), 12, 10);
+            var fr4 = new StepperFrame(new Point3d_GL(0, 0, 0), 0, 10);
+            var fr5 = new StepperFrame(new Point3d_GL(10, 0, 0), 4, 10);
+            var fr6 = new StepperFrame(new Point3d_GL(20, 10, 0), 8, 10);
+            var fr7 = new StepperFrame(new Point3d_GL(0, 0, 0), 0, 10);
+            var def_frames = new StepperFrame[] { fr0, fr1, fr2, fr3, fr4, fr5, fr6, fr7 };
+            var stepper_frames = convert_frames(
+                def_frames, new Point3d_GL(100, 100, 100), 
+                100,       //e_step
+                104616.18, //t_koef
+                3,        //wind
+                0.2);      //min_dist
+            
+            var coms = new List<string>();
+            for(int i = 0; i < stepper_frames.Length; i++)
+            {
+                Console.WriteLine(i+" "+stepper_frames[i].p_xyz.x+" "+ stepper_frames[i].p_xyz.y + " " + stepper_frames[i].p_xyz.z + " " + stepper_frames[i].e + " " + stepper_frames[i].time_abs + " ");
+                var com = "M596 G1 X"+Math.Round(stepper_frames[i].p_xyz.x)+" Y"+ Math.Round(stepper_frames[i].p_xyz.y) + " Z" + Math.Round(stepper_frames[i].p_xyz.z) + " E" + Math.Round(stepper_frames[i].e) + " W" + Math.Round(stepper_frames[i].time_abs);
+                coms.Add(com);
+            }
+            return coms.ToArray();
+        }
+
+        
+        static public StepperFrame add(StepperFrame fr1, StepperFrame fr2)
+        {
+            var fr_sum = fr1.clone();
+            fr_sum.p_xyz.x += fr2.p_xyz.x;
+            fr_sum.p_xyz.y += fr2.p_xyz.y;
+            fr_sum.p_xyz.z += fr2.p_xyz.z;
+            fr_sum.e += fr2.e;
+            return fr_sum;
+        }
+       
+    }
+
+
+
+
+    public static class Trajectory
+    {
+        static public List<List<Point3d_GL>> OptimizeTranzitions(List<List<Point3d_GL>> traj)
+        {
+            List<int[][]> approach = new List<int[][]>();
+
+            for (int i = 0; i < traj.Count; i++)
+            {
+                int s1 = 0;
+                int s2 = 1;
+                int e1 = -1;
+                int e2 = -2;
+                approach.Add(new int[][] { new int[] { s1, e1 }, new int[] { s2, e2 }, new int[] { e1, s1 }, new int[] { e2, s2 } });
+            }
+
+            List<double[][]> dists = new List<double[][]>();
+
+            for (int i = 0; i < traj.Count - 1; i++)
+            {
+                double[][] distsBetween = new double[approach[i].Length][];
+
+                for (int layer1 = 0; layer1 < approach[i].Length; layer1++)
+                {
+                    double[] distsLayer = new double[approach[i + 1].Length];
+
+                    for (int layer2 = 0; layer2 < approach[i].Length; layer2++)
+                    {
+                        distsLayer[layer2] = Distance(traj[i][approach[i][layer1][layer2]], traj[i + 1][approach[i][layer1][layer2]]);
+                    }
+
+                    distsBetween[layer1] = distsLayer;
+                }
+
+                dists.Add(distsBetween);
+            }
+
+            return traj;
+        }
+
+        static int get_ind(int i, int len)
+        {
+            if (i<0)
+                return len+i;
+            else
+                return i;
+        }
+
+        static public List<List<Point3d_GL>> OptimizeTranzitions2Layer(List<List<Point3d_GL>> traj)
+        {
+            List<int[][]> approach = new List<int[][]>();
+
+            for (int i = 0; i < traj.Count; i++)
+            {
+                int s1 = 0;
+                int s2 = 1;
+                int e1 = -1;
+                int e2 = -2;
+                approach.Add(new int[][] { new int[] { s1, e1 }, new int[] { s2, e2 }, new int[] { e1, s1 }, new int[] { e2, s2 } });
+            }
+
+            List<double[][]> dists = new List<double[][]>();
+
+            for (int i = 0; i < approach.Count; i++)
+            {
+                double[][] b = new double[approach[i].Length][];
+
+                for (int j = 0; j < approach[i].Length; j++)
+                {
+                    double[] c = new double[approach[i].Length];
+                    for (int k = 0; k < approach[i].Length; k++)
+                    {
+                        c[k] = 1000000000.0f;
+                    }
+
+                    b[j] = c;
+                }
+
+                dists.Add(b);
+            }
+
+            for (int i = 0; i < traj.Count - 1; i++)
+            {
+                for (int layer1 = 0; layer1 < approach[i].Length; layer1++)
+                {
+                    for (int layer2 = 0; layer2 < approach[i + 1].Length; layer2++)
+                    {
+                        if (traj[i] != null && traj[i + 1] != null)
+                        {
+                            var i1 = get_ind(approach[ i][layer1][1], traj[i].Count) ;
+                            var i2 = get_ind(approach[i+1][layer2][0], traj[i+1].Count);
+                            var p1 = traj[i][i1];
+                            var p2 = traj[i+1][i2];
+                            dists[i][layer1][layer2] = 
+                                Distance(p1,p2);
+                        }
+                    }
+                }
+            }
+
+            List<int> fastWay = new List<int>();
+            List<List<Point3d_GL>> traj_opt = new List<List<Point3d_GL>>();
+            List< List<int>> ways = new List<List<int>>();
+            double min_dist = double.MaxValue;
+            for (int f = 0; f < 4; f++)
+            {
+                var traj_cl = clone_traj(traj);
+                for (int i = 0; i < dists.Count; i++)
+                {
+                    int low, up;
+                    if (i == 0)
+                    {
+                        (low, up) = FindBestWayFirst(dists[i], f);
+                        fastWay = new List<int> { low, up };
+                    }
+                    else
+                    {
+                        (low, up) = FindBestWayCont(dists[i], fastWay[fastWay.Count - 1]);
+                        fastWay.Add(up);
+                    }
+                }
+                ways.Add(fastWay);
+                //Console.WriteLine("Traj after___________");
+                var traj_opt_loc = OptimizeTrans(traj_cl.ToArray(), approach.ToList(), fastWay).ToList();
+                var dist_opt = CompTrans(traj_opt_loc.ToArray());
+                if(dist_opt < min_dist)
+                {
+                    min_dist = dist_opt;
+                    traj_opt = clone_traj(traj_opt_loc);
+                }
+                Console.WriteLine("dist_opt: "+dist_opt);
+            }
+
+            //Console.WriteLine("Traj before___________");
+            var dist_def = CompTrans(traj.ToArray());
+            Console.WriteLine("dist_def: " + dist_def);
+
+            return traj_opt;
+        }
+        static List<List<Point3d_GL>>  clone_traj(List<List<Point3d_GL>> tr)
+        {
+            var tr_cl = new List<List<Point3d_GL>>();
+            for(int i = 0; i < tr.Count; i++)
+            {
+                var l_cl = new List<Point3d_GL>();
+                for (int j = 0; j < tr[i].Count; j++)
+                {
+                    l_cl.Add(tr[i][j].Clone());
+                }
+                tr_cl.Add(l_cl);
+            }
+            return tr_cl;
+        }
+
+        static public TrajectoryPath OptimizeTranzitions2LayerPath(TrajectoryPath traj)
+        {
+            if (traj.layers.Count < 2) return traj;
+            List<int[][]> approach = new List<int[][]>();
+
+            for (int i = 0; i < traj.layers.Count; i++)
+            {
+                int s1 = 0;
+                int s2 = 1;
+                int e1 = -1;
+                int e2 = -2;
+                approach.Add(new int[][] { new int[] { s1, e1 }, new int[] { s2, e2 }, new int[] { e1, s1 }, new int[] { e2, s2 } });
+            }
+
+            List<double[][]> dists = new List<double[][]>();
+
+            for (int i = 0; i < approach.Count; i++)
+            {
+                double[][] b = new double[approach[i].Length][];
+
+                for (int j = 0; j < approach[i].Length; j++)
+                {
+                    double[] c = new double[approach[i].Length];
+                    for (int k = 0; k < approach[i].Length; k++)
+                    {
+                        c[k] = 1000000000.0f;
+                    }
+
+                    b[j] = c;
+                }
+
+                dists.Add(b);
+            }
+
+            for (int i = 0; i < traj.layers.Count - 1; i++)
+            {
+                for (int layer1 = 0; layer1 < approach[i].Length; layer1++)
+                {
+                    for (int layer2 = 0; layer2 < approach[i + 1].Length; layer2++)
+                    {
+                        if (traj.layers[i] != null && traj.layers[i + 1] != null)
+                        {
+                            var p1 = traj.layers[i].getPoint(approach[i][layer1][1]);
+                            var p2 = traj.layers[i+1].getPoint(approach[i + 1][layer2][0]);
+                            dists[i][layer1][layer2] =
+                                Distance(p1, p2);
+                        }
+                    }
+                }
+            }
+
+            List<int> fastWay = new List<int>();
+
+            /*for (int i = 0; i < dists.Count; i++)
+            {
+                int low, up;
+                if (i == 0)
+                {
+                    (low, up) = FindBestWayFirst_old(dists[i]);
+                    fastWay = new List<int> { low, up };
+                }
+                else
+                {
+                    (low, up) = FindBestWayCont(dists[i], fastWay[fastWay.Count - 1]);
+                    fastWay.Add(up);
+                }
+            }*/
+            TrajectoryPath traj_opt = traj.Clone();
+            double dist_min = double.MaxValue;
+            for (int f = 0; f < 4; f++)
+            {
+                for (int i = 0; i < dists.Count; i++)
+                {
+                    int low, up;
+                    if (i == 0)
+                    {
+                        (low, up) = FindBestWayFirst(dists[i], f);
+                        fastWay = new List<int> { low, up };
+                    }
+                    else
+                    {
+                        (low, up) = FindBestWayCont(dists[i], fastWay[fastWay.Count - 1]);
+                        fastWay.Add(up);
+                    }
+                }
+                var traj_cur = OptimizeTransPath(traj.Clone(), approach.ToList(), fastWay);
+                var len = CompTrans(traj_cur.layers.ToArray());
+                if(len<dist_min)
+                {
+                    dist_min = len;
+                    traj_opt = traj_cur;
+                }
+                Console.WriteLine(len);
+            }
+            
+            return traj_opt;
+        }
+
+        static  public (int,int) FindBestWayFirst(double[][] trans_map,int first)
+        {
+            int low = 0;
+            int up = 0;
+            double min_dist = 100000;
+            
+            for (int j = 0; j < trans_map[first].Length; j++)
+            {
+                if (trans_map[first][j] < min_dist)
+                {
+                    min_dist = trans_map[first][j];
+                    low = first;
+                    up = j;
+                }
+            }
+            
+            return (low, up);
+        }
+
+        static public (int, int) FindBestWayFirst_old(double[][] trans_map)
+        {
+            int low = 0;
+            int up = 0;
+            double min_dist = 100000;
+            for (int i = 0; i < trans_map.Length; i++)
+            {
+                for (int j = 0; j < trans_map[i].Length; j++)
+                {
+                    if (trans_map[i][j] < min_dist)
+                    {
+                        min_dist = trans_map[i][j];
+                        low = i;
+                        up = j;
+                    }
+                }
+            }
+            return (low, up);
+        }
+
+        public static (int, int) FindBestWayCont(double[][] transMap, int prevL)
+        {
+            int low = prevL;
+            int up = 0;
+            double minDist = 100000;
+            for (int j = 0; j < transMap[prevL].Length; j++)
+            {
+                if (transMap[prevL][j] < minDist)
+                {
+                    minDist = transMap[prevL][j];
+                    up = j;
+                }
+            }
+            return (low, up);
+        }
+
+        public static List<Point3d_GL>[] OptimizeTrans(List<Point3d_GL>[] traj, List<int[][]> approach, List<int> fastWay)
+        {
+            var optTraj = new List<Point3d_GL>[traj.Length];
+            for (int i = 0; i < traj.Length; i++)
+            {
+                optTraj[i] = SetLayerDirection(traj[i], approach[i][fastWay[i]]);
+            }
+            return optTraj;
+        }
+        public static TrajectoryPath OptimizeTransPath(TrajectoryPath traj, List<int[][]> approach, List<int> fastWay)
+        {
+            var optTraj = new List<LayerPath>();
+            for (int i = 0; i < traj.layers.Count; i++)
+            {
+                optTraj.Add( SetLayerDirectionPath(traj.layers[i], approach[i][fastWay[i]]));
+            }
+            return new TrajectoryPath { layers = optTraj };
+        }
+        public static double CompTrans(List<Point3d_GL>[] traj)
+        {
+            var trans = new List<double>();
+            double allTR = 0;
+            for (int i = 0; i < traj.Length - 1; i++)
+            {
+                if (traj[i] != null && traj[i + 1] != null)
+                {
+                    double dist = Distance(traj[i][traj[i].Count - 1], traj[i + 1][0]);
+                    trans.Add(dist);
+                    allTR += dist;
+                }
+            }
+            return allTR;
+        }
+
+        public static double CompTrans(LayerPath[] traj)
+        {
+            var trans = new List<double>();
+            double allTR = 0;
+            for (int i = 0; i < traj.Length - 1; i++)
+            {
+                if (traj[i] != null && traj[i + 1] != null)
+                {
+                    double dist = Distance(traj[i].getPoint(-1), traj[i + 1].getPoint(0));
+                    trans.Add(dist);
+                    allTR += dist;
+                }
+            }
+            return allTR;
+        }
+
+        public static List<Point3d_GL> SetLayerDirection(List<Point3d_GL> layer, int[] inds)
+        {
+            if (inds[0] == 0)
+            {
+                //nothing
+            }
+            else if (inds[0] == -1)
+            {
+                layer.Reverse();
+            }
+            else if (inds[0] == 1)
+            {
+                layer = ReverseLineDirect(layer);
+            }
+            else if (inds[0] == -2)
+            {
+                layer.Reverse();
+                layer = ReverseLineDirect(layer);
+            }
+            return layer;
+        }
+        public static LayerPath SetLayerDirectionPath(LayerPath layer, int[] inds)
+        {
+            if (inds[0] == 0)
+            {
+                //nothing
+            }
+            else if (inds[0] == -1)
+            {
+                layer.lines.Reverse();
+                layer.ReverseLines();
+            }
+            else if (inds[0] == 1)
+            {
+                layer.ReverseLines();
+            }
+            else if (inds[0] == -2)
+            {
+                layer.lines.Reverse();
+            }
+            return layer;
+        }
+
+        public static List<Point3d_GL> ReverseLineDirect(List<Point3d_GL> layer)
+        {
+            int i = 0;
+            int stop = 0;
+            if (layer.Count % 2 != 0)
+            {
+                stop = 1;
+            }
+            while (i < layer.Count - stop)
+            {
+                Point3d_GL lam = layer[i + 1].Clone();
+                layer[i + 1] = layer[i].Clone();
+                layer[i] = lam.Clone();
+                i += 2;
+            }
+            return layer;
+        }
+        public static double Distance(Point3d_GL p1, Point3d_GL p2)
+        {
+            return (p1 - p2).magnitude();
+        }
+    }
+
+
+    public class PatternSettings
+    {
+        public double min_dist;
+        public double Min_dist
+        {
+            get { return min_dist; }
+            set { min_dist = value; }
+        }
+
+        public double dim_x;
+        public double Dim_x
+        {
+            get { return dim_x; }
+            set { dim_x = value; }
+        }
+        public double dim_y;
+        public double Dim_y
+        {
+            get { return dim_y; }
+            set { dim_y = value; }
+        }
+        public double arc_dist;
+        public double Arc_dist
+        {
+            get { return arc_dist; }
+            set { arc_dist = value; }
+        }
+        public double r;
+        public double R
+        {
+            get { return r; }
+            set { r = value; }
+        }
+        public double step;
+        public double Step
+        {
+            get { return step; }
+            set { step = value; }
+        }
+        public double angle;
+
+        public double Angle
+        {
+            get { return angle; }
+            set { angle = value; }
+        }
+
+        public double angle_layers;
+
+        public double Angle_layers
+        {
+            get { return angle_layers; }
+            set { angle_layers = value; }
+        }
+        public double filling;
+
+        public double Filling
+        {
+            get { return filling; }
+            set { filling = value; }
+        }
+        public PathPlanner.PatternType patternType;
+        public PathPlanner.PatternType PatternType
+        {
+            get { return patternType; }
+            set { patternType = value; }
+        }
+        public bool start_dir_r;
+        public bool Start_dir_r
+        {
+            get { return start_dir_r; }
+            set { start_dir_r = value; }
+        }
+    }
+
+
+}
