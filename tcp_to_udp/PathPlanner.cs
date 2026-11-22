@@ -1872,7 +1872,7 @@ namespace tcp_to_udp
 
         public enum delta_calibr_ps_count { ps4,  ps18 };
 
-        public Point3d_GL bed_calib_vec = new Point3d_GL(0.0049,0.0083,1);
+        public Point3d_GL bed_calib_vec = new Point3d_GL(0, 0, 1);   // Fabion: стол без наклона, пока не откалиброван M616
 
         //public Point3d_GL bed_calib_vec = new Point3d_GL(0.0, 0.0, 1);
 
@@ -1905,7 +1905,30 @@ namespace tcp_to_udp
         public int pause_prog_line = 0;
 
 
-        public long[] cur_pos = new long[] { 0, 0, 0, 0 };
+        public long[] cur_pos = new long[] { 0, 0, 0, 0 };   // X, Y, Z активного шприца, E активного шприца (шаги)
+        public long[] all_pos = new long[8];                 // Fabion: все 8 моторов (шаги)
+
+        //---------------- Fabion: картезианская кинематика, 3 шприца ----------------
+        // Моторы: 0 X, 1 Y, 2..4 Z1..Z3, 5..7 E1..E3. tool_active = 0..2.
+        public const int TOOLS_COUNT = 3;
+        public int z_motor(int tool) { return 2 + Math.Clamp(tool, 0, TOOLS_COUNT - 1); }
+        public int e_motor(int tool) { return 5 + Math.Clamp(tool, 0, TOOLS_COUNT - 1); }
+        public int z_motor() { return z_motor(tool_active); }
+        public int e_motor() { return e_motor(tool_active); }
+        public double steps_mm(int motor)
+        {
+            if (settins_string != null && settins_string.steps_per_mm1 != null && motor < settins_string.steps_per_mm1.Length && settins_string.steps_per_mm1[motor] > 0)
+                return settins_string.steps_per_mm1[motor];
+            return 100;
+        }
+        // Обновить положение по телеметрии (все 8 моторов)
+        public void set_all_pos(long[] pos8)
+        {
+            all_pos = (long[])pos8.Clone();
+            cur_pos = new long[] { all_pos[0], all_pos[1], all_pos[z_motor()], all_pos[e_motor()] };
+        }
+        // Положение мотора в мм (машинные координаты)
+        public double motor_mm(int motor) { return all_pos[motor] / steps_mm(motor); }
         public long[] prev_pos = new long[] { 0, 0, 0, 0 };
 
 
@@ -1980,6 +2003,19 @@ namespace tcp_to_udp
                     if (kinematic_count == 0)
                     {
                         frames_kinematic.Add(last_frame);
+                        // Fabion: подход к первой точке участка без диагонали по Z:
+                        // вверх — сначала Z, вниз — сначала XY
+                        var p0 = last_frame.p_xyz; var p1 = stepper_frames[i].p_xyz;
+                        var dxy = Math.Sqrt((p1.x - p0.x) * (p1.x - p0.x) + (p1.y - p0.y) * (p1.y - p0.y));
+                        var dz = p1.z - p0.z;
+                        if (dxy > 0.01 && Math.Abs(dz) > 0.01)
+                        {
+                            var mid = last_frame.clone();
+                            mid.vel = stepper_frames[i].vel;
+                            if (dz > 0) mid.p_xyz = new Point3d_GL(p0.x, p0.y, p1.z);
+                            else mid.p_xyz = new Point3d_GL(p1.x, p1.y, p0.z);
+                            frames_kinematic.Add(mid);
+                        }
                     }
 
                     frames_kinematic.Add(stepper_frames[i]);
@@ -2066,9 +2102,11 @@ namespace tcp_to_udp
             cur_prog_number++;
             coms.Add(new StepperFrame(1, 588, "A0 F0 B" + lookup_buf + " C" + stepper_frames.Length, true));//   ring_buf_all_counter_write
             //coms.Add();//  e = 0
-            var com_reset_e = new StepperFrame(1, 587, "I7 C0", true);
+            var com_reset_e = new StepperFrame(1, 587, "I" + e_motor() + " C0", true);
             com_reset_e.reset_extr = true;
             coms.Add(com_reset_e);
+            // Fabion: буфер платы ведёт Z и E активного шприца
+            coms.Add(new StepperFrame(1, 588, "K" + z_motor() + " L" + e_motor(), true));
             var stop_len = comp_stop_len(stepper_frames);
             abs_pos_extr = 0;
             int i_start = Math.Min(StepperPrinter.prog_loaded_bef_start, stop_len - 1);
@@ -2131,300 +2169,213 @@ namespace tcp_to_udp
             return main_frames;
         }
 
+        //================ Fabion: разбор стандартного G-кода ================
+        // Поддерживается: G0/G1, G2/G3 (I J или R), G4 P(мс)/S(с), G28 [X Y Z], G90/G91, G92,
+        // M82/M83, M104/M109 (шприц), M140/M190 (стол), M106/M107, T0..T2, G54 X<номер подложки>.
+        // Номера строк N и контрольные суммы *, комментарии ; и (...) отбрасываются.
+        // Регистр не важен, пробелы между словами не обязательны (G1X10Y5).
+        public static List<KeyValuePair<char, double>> parse_gcode_words(string line)
+        {
+            var words = new List<KeyValuePair<char, double>>();
+            if (line == null) return words;
+            var sc = line.IndexOf(';'); if (sc >= 0) line = line.Substring(0, sc);
+            var st = line.IndexOf('*'); if (st >= 0) line = line.Substring(0, st);
+            var sb = new StringBuilder();
+            int depth = 0;
+            foreach (var c in line) { if (c == '(') { depth++; continue; } if (c == ')') { if (depth > 0) depth--; continue; } if (depth == 0) sb.Append(c); }
+            var t = sb.ToString().ToUpperInvariant();
+            int k = 0;
+            while (k < t.Length)
+            {
+                var c = t[k];
+                if (c >= 'A' && c <= 'Z')
+                {
+                    int s0 = ++k;
+                    while (k < t.Length && (char.IsDigit(t[k]) || t[k] == '.' || t[k] == '-' || t[k] == '+' || t[k] == ' ')) k++;
+                    var num = t.Substring(s0, k - s0).Replace(" ", "");
+                    var v = parse_double(num);
+                    words.Add(new KeyValuePair<char, double>(c, double.IsNaN(v) ? 0 : v));
+                }
+                else k++;
+            }
+            return words;
+        }
+
+        static bool has(List<KeyValuePair<char, double>> w, char c) { foreach (var kv in w) if (kv.Key == c) return true; return false; }
+        static double get(List<KeyValuePair<char, double>> w, char c, double def = 0) { foreach (var kv in w) if (kv.Key == c) return kv.Value; return def; }
+
         public StepperFrame[] convert_g_code_to_stepperframes(string[] orig_g_code, StepperPrinter printer)
         {
             var coms = new List<StepperFrame>();
 
-            var p_offs = new Point3d_GL(0, 0, 0);
-            var e_offs = 0d;
+            // pos — логические координаты программы (то, что пишет G-код), p_off — смещение G92.
+            // В кадр уходит pos + p_off. G92 меняет только логические координаты, станок не двигается.
+            var pos = new Point3d_GL(0, 0, 0);
+            var e_pos = 0d;
+            var p_off = new Point3d_GL(0, 0, 0);
+            var e_off = 0d;
+            var e_shift = 0d;                        // E на момент последней команды шлюза (T, G54): участок после неё начинается с E = 0
+            var vel_cur = 10d;                       // мм/с
+            bool pos_rel = false, extr_rel = false;
+            double arc_seg = 0.2;                    // длина хорды при разбиении дуг, мм
 
+            if (dest_coordinate_system == coordinate_system.AUTO) coms.Add(new StepperFrame(0, 631, ""));
 
-            var p_cur = new Point3d_GL(0, 0, 0);
-            var e_cur = 0d;
+            Action add_move = () => coms.Add(new StepperFrame(pos + p_off, e_pos + e_off - e_shift, vel_cur));
 
-
-            var vel_cur = 10d;
-            var k_vel = 1d / 60d;//if mm\min
-
-            bool extr_rel = false;
-            bool pos_rel = false;
-
-            var p_abs = new Point3d_GL(0, 0, 0);
-            var e_abs = 0d;
-
-            if (dest_coordinate_system == coordinate_system.AUTO)
-            {
-                coms.Add(new StepperFrame(0, 631, ""));
-                //coms.Add(new StepperFrame(0, 640, "1"));
-                //coms.Add(new StepperFrame(new Point3d_GL(0, 0, safe_z), 0, travel_xyz_vel));
-            }
             for (int i = 0; i < orig_g_code.Length; i++)
             {
-                var line = orig_g_code[i].Trim();
-                line = line.Replace("  ", " ");
-                line = line.Replace("  ", " ");
-                var vals = line.Split(' ');
-                //if (vals.Length<2) continue;
-                if (pos_rel)
+                var w = parse_gcode_words(orig_g_code[i]);
+                w.RemoveAll(kv => kv.Key == 'N');
+                if (w.Count == 0) continue;
+
+                // T может стоять отдельно
+                if (w[0].Key == 'T')
                 {
-                    p_cur = new Point3d_GL(0, 0, 0);
-                }
-                if (extr_rel || pos_rel)
-                {
-                    e_cur = 0;
-                }
-
-                if (vals[0].Contains("G1") || vals[0].Contains("G0"))
-                {
-
-                    for (int j = 1; j < vals.Length; j++)
-                    {
-                        if (vals[j].Length < 2) continue;
-                        var lit = vals[j][0];
-                        var v_str = vals[j].Substring(1);
-                        var val_parsed = parse_double(v_str);
-                        if (val_parsed == double.NaN) continue;
-                        if (lit == 'X') p_cur.x = val_parsed;
-                        if (lit == 'Y') p_cur.y = val_parsed;
-                        if (lit == 'Z') p_cur.z = val_parsed;
-                        if (lit == 'E') e_cur = val_parsed;
-                        if (lit == 'F') vel_cur = val_parsed * k_vel;
-
-                        
-                    }
-
-                    if (pos_rel)
-                    {
-                        p_abs += new Point3d_GL(p_cur.x, p_cur.y, p_cur.z);
-                    }
-                    else
-                    {
-                        p_abs = new Point3d_GL(p_cur.x, p_cur.y, p_cur.z) + p_offs;
-                    }
-
-
-                    if (extr_rel || pos_rel)
-                    {
-                        e_abs += e_cur;
-                    }
-                    else
-                    {
-                        e_abs = e_cur + e_offs;
-                    }
-                    Console.WriteLine("e_abs: " + e_abs + "; e_cur: " + e_cur + "; e_offs: " + e_offs + "; pos_rel: " + pos_rel);
-                    coms.Add(new StepperFrame(p_abs.Clone(), e_abs, vel_cur));
-                }
-
-
-                if (vals[0].Contains("G2") || vals[0].Contains("G3"))//to do
-                {
-
-                }
-
-                if (vals[0].Contains("G4"))
-                {
-                    double wait_ms = 0;
-                    double wait_s = 0;
-                    for (int j = 1; j < vals.Length; j++)
-                    {
-                        if (vals[j].Length < 2) continue;
-                        var lit = vals[j][0];
-                        var v_str = vals[j].Substring(1);
-                        var val_parsed = parse_double(v_str);
-                        if (val_parsed == double.NaN) continue;
-                        if (lit == 'S') wait_s = val_parsed;
-                        if (lit == 'P') wait_ms = val_parsed;
-                    }
-
-                    coms.Add(new StepperFrame(1, 589, "P" + (wait_ms + 1000 * wait_s).ToString()));
-                }
-
-                if (vals[0].Contains("G28"))
-                {
-                    coms.Add(new StepperFrame(1, 589, "X12"));
-                }
-
-                if (vals[0].Contains("G90"))
-                {
-                    pos_rel = false;
-                    //p_cur = new Point3d_GL(0, 0, 0);
-                    if (extr_rel)
-                    {
-                        //e_cur = 0;
-                    }
-                }
-                if (vals[0].Contains("G91"))
-                {
-                    pos_rel = true;
-                    //e_abs = e_offs;
-                }
-
-                if (vals[0].Contains("M82"))
-                {
-                    extr_rel = false;
-                }
-                if (vals[0].Contains("M83"))
-                {
-                    extr_rel = true;
-                }
-
-                if (vals[0].Contains("G92"))
-                {
-                    var p_st = new Point3d_GL(0, 0, 0);
-                    var e_st = 0d;
-                    var x_en = 0;
-                    var y_en = 0;
-                    var z_en = 0;
-                    var e_en = 0;
-                    for (int j = 1; j < vals.Length; j++)
-                    {
-                        if (vals[j].Length < 2) continue;
-                        var lit = vals[j][0];
-                        var v_str = vals[j].Substring(1);
-                        var val_parsed = parse_double(v_str);
-                        if (val_parsed == double.NaN) continue;
-                        if (lit == 'X') { p_offs.x = p_abs.x; p_abs.x = val_parsed; x_en = 1; p_cur.x = val_parsed; }
-                        if (lit == 'Y') { p_offs.y = p_abs.y; p_abs.y = val_parsed; y_en = 1; p_cur.y = val_parsed; }
-                        if (lit == 'Z') { p_offs.z = p_abs.z; p_abs.z = val_parsed; z_en = 1; p_cur.z = val_parsed; }
-                        if (lit == 'E') { e_offs = e_abs; e_abs = val_parsed; e_en = 1; e_cur = val_parsed; } //
-                    }
-
-                    //coms.Add(new StepperFrame(0, 612, p_st.x + " " + p_st.y + " " + p_st.z + " " + e_st + " " + x_en + " " + y_en + " " + z_en + " " + e_en));
-                    //p_cur = new Point3d_GL(0,0,0);
-
-
-                }
-
-                if (vals[0].Contains("M106"))
-                {
-                    var fan_ind = 0;
-                    var fan_val = 0;
-                    var board_ind = 0;
-                    for (int j = 1; j < vals.Length; j++)
-                    {
-                        if (vals[j].Length < 2) continue;
-                        var lit = vals[j][0];
-                        var v_str = vals[j].Substring(1);
-                        var val_parsed = parse_double(v_str);
-                        if (val_parsed == double.NaN) continue;
-                        if (lit == 'S') fan_val = (int)val_parsed;
-                        if (lit == 'P') fan_ind = (int)val_parsed;
-                        if (lit == 'B') board_ind = (int)val_parsed;
-                    }
-
-                    coms.Add(new StepperFrame(board_ind, 581, "I" + fan_ind + " A" + fan_val));
-                }
-
-                if (vals[0].Contains("M107"))
-                {
-                    var fan_ind = 0;
-                    var fan_val = 0;
-                    var board_ind = 0;
-                    for (int j = 1; j < vals.Length; j++)
-                    {
-                        if (vals[j].Length < 2) continue;
-                        var lit = vals[j][0];
-                        var v_str = vals[j].Substring(1);
-                        var val_parsed = parse_double(v_str);
-                        if (val_parsed == double.NaN) continue;
-                        if (lit == 'S') fan_val = (int)val_parsed;
-                        if (lit == 'P') fan_ind = (int)val_parsed;
-                        if (lit == 'B') board_ind = (int)val_parsed;
-                    }
-
-                    coms.Add(new StepperFrame(board_ind, 581, "I" + fan_ind + " A0"));
-                    pos_rel = false;
-                }
-
-
-                if (vals[0].Contains("M140"))
-                {
-                    var temp_dest = 0d;
-                    for (int j = 1; j < vals.Length; j++)
-                    {
-                        if (vals[j].Length < 2) continue;
-                        var lit = vals[j][0];
-                        var v_str = vals[j].Substring(1);
-                        var val_parsed = parse_double(v_str);
-                        if (val_parsed == double.NaN) continue;
-                        if (lit == 'S') { temp_dest = val_parsed; }
-                    }
-                    if (temp_dest < StepperPrinter.min_temp_bed) coms.Add(new StepperFrame(2, 579, "E0 T" + temp_dest, false, 0));
-                    else coms.Add(new StepperFrame(2, 579, "E1 T" + temp_dest, false, 0));
-
-                }
-
-                if (vals[0].Contains("M190"))
-                {
-                    var temp_dest = 0d;
-                    for (int j = 1; j < vals.Length; j++)
-                    {
-                        if (vals[j].Length < 2) continue;
-                        var lit = vals[j][0];
-                        var v_str = vals[j].Substring(1);
-                        var val_parsed = parse_double(v_str);
-                        if (val_parsed == double.NaN) continue;
-                        if (lit == 'S') { temp_dest = val_parsed; }
-                    }
-
-
-                    if (temp_dest < StepperPrinter.min_temp_bed) coms.Add(new StepperFrame(2, 579, "E0 T" + temp_dest, false, 1));
-                    else coms.Add(new StepperFrame(2, 579, "E1 T" + temp_dest, false, 1));
-                }
-
-                if (vals[0].Contains("T"))
-                {
-                    //main com
-                    int tool_dest_ind = 0;
-                    for (int j = 0; j < vals.Length; j++)
-                    {
-                        if (vals[j].Length < 2) continue;
-                        var lit = vals[j][0];
-                        var v_str = vals[j].Substring(1);
-                        var val_parsed = parse_double(v_str);
-                        if (val_parsed == double.NaN) continue;
-                        if (lit == 'T') { tool_dest_ind = (int)val_parsed; }
-                    }
-
-                    //coms.Add(new StepperFrame(0, 640, "2"));
-                    //coms.Add(new StepperFrame(new Point3d_GL(0, 0, safe_z), 0, travel_xyz_vel));
-
-                    coms.Add(new StepperFrame(0, 620, tool_dest_ind.ToString()));
-
-                    if (dest_coordinate_system == coordinate_system.AUTO)
-                    {
-                        coms.Add(new StepperFrame(0, 631, ""));
-                        //coms.Add(new StepperFrame(0, 640, "1"));
-                        //coms.Add(new StepperFrame(new Point3d_GL(0, 0, safe_z), 0, travel_xyz_vel));
-                    }
-
-                    
-
+                    int tool = (int)w[0].Value;
+                    coms.Add(new StepperFrame(0, 620, tool.ToString()));
+                    if (dest_coordinate_system == coordinate_system.AUTO) coms.Add(new StepperFrame(0, 631, ""));
                     if (dest_coordinate_system == coordinate_system.MANUAL) coms.Add(new StepperFrame(0, 640, "0"));
                     if (dest_coordinate_system == coordinate_system.AUTO) coms.Add(new StepperFrame(0, 640, "1"));
-
-                    /*p_abs.z += safe_z;
-                    coms.Add(new StepperFrame(p_abs.Clone(), e_abs, vel_cur));
-
-                    p_abs.z -= safe_z;
-                    coms.Add(new StepperFrame(p_abs.Clone(), e_abs, vel_cur));*/
+                    e_shift = e_pos + e_off;
+                    continue;
                 }
-
-                if (vals[0].Contains("G54"))
+                if (w[0].Key != 'G' && w[0].Key != 'M')
                 {
-                    var plate_num = 0;
-                    //main com
-                    for (int j = 0; j < vals.Length; j++)
+                    // строка без G/M — продолжение предыдущего движения (модальный G1)
+                    w.Insert(0, new KeyValuePair<char, double>('G', 1));
+                }
+                var letter = w[0].Key;
+                var code = w[0].Value;
+                var args = w.GetRange(1, w.Count - 1);
+
+                if (letter == 'G' && (code == 0 || code == 1))
+                {
+                    if (has(args, 'F')) vel_cur = get(args, 'F') / 60d;
+                    if (pos_rel)
                     {
-                        if (vals[j].Length < 2) continue;
-                        var lit = vals[j][0];
-                        var v_str = vals[j].Substring(1);
-                        var val_parsed = parse_double(v_str);
-                        if (val_parsed == double.NaN) continue;
-                        if (lit == 'X') { plate_num = (int)val_parsed; }
+                        pos.x += get(args, 'X'); pos.y += get(args, 'Y'); pos.z += get(args, 'Z');
                     }
-                    //X - plate select
-                    coms.Add(new StepperFrame(0, 637, plate_num.ToString()));
+                    else
+                    {
+                        if (has(args, 'X')) pos.x = get(args, 'X');
+                        if (has(args, 'Y')) pos.y = get(args, 'Y');
+                        if (has(args, 'Z')) pos.z = get(args, 'Z');
+                    }
+                    if (has(args, 'E'))
+                    {
+                        if (extr_rel || pos_rel) e_pos += get(args, 'E');
+                        else e_pos = get(args, 'E');
+                    }
+                    if (has(args, 'X') || has(args, 'Y') || has(args, 'Z') || has(args, 'E')) add_move();
+                }
+                else if (letter == 'G' && (code == 2 || code == 3))
+                {
+                    if (has(args, 'F')) vel_cur = get(args, 'F') / 60d;
+                    var start = pos.Clone();
+                    var end = pos.Clone();
+                    if (pos_rel) { end.x += get(args, 'X'); end.y += get(args, 'Y'); end.z += get(args, 'Z'); }
+                    else
+                    {
+                        if (has(args, 'X')) end.x = get(args, 'X');
+                        if (has(args, 'Y')) end.y = get(args, 'Y');
+                        if (has(args, 'Z')) end.z = get(args, 'Z');
+                    }
+                    var e_start = e_pos;
+                    var e_end = e_pos;
+                    if (has(args, 'E')) e_end = (extr_rel || pos_rel) ? e_pos + get(args, 'E') : get(args, 'E');
+
+                    bool cw = code == 2;
+                    double cx, cy;
+                    if (has(args, 'R'))
+                    {
+                        var r = get(args, 'R');
+                        var dx = end.x - start.x; var dy = end.y - start.y;
+                        var d = Math.Sqrt(dx * dx + dy * dy);
+                        if (d < 1e-9 || Math.Abs(r) < d / 2) { pos = end; e_pos = e_end; add_move(); continue; }
+                        var h = Math.Sqrt(r * r - d * d / 4);
+                        // при R<0 — дуга больше 180°
+                        var sgn = (cw ^ (r < 0)) ? -1 : 1;
+                        cx = (start.x + end.x) / 2 - sgn * h * dy / d;
+                        cy = (start.y + end.y) / 2 + sgn * h * dx / d;
+                    }
+                    else
+                    {
+                        cx = start.x + get(args, 'I');
+                        cy = start.y + get(args, 'J');
+                    }
+                    var rad = Math.Sqrt((start.x - cx) * (start.x - cx) + (start.y - cy) * (start.y - cy));
+                    var a0 = Math.Atan2(start.y - cy, start.x - cx);
+                    var a1 = Math.Atan2(end.y - cy, end.x - cx);
+                    var sweep = a1 - a0;
+                    if (cw && sweep >= -1e-9) sweep -= 2 * Math.PI;
+                    if (!cw && sweep <= 1e-9) sweep += 2 * Math.PI;
+                    int n = Math.Max(1, (int)Math.Ceiling(Math.Abs(sweep) * rad / arc_seg));
+                    n = Math.Min(n, 2000);
+                    for (int s_i = 1; s_i <= n; s_i++)
+                    {
+                        var t = (double)s_i / n;
+                        var a = a0 + sweep * t;
+                        pos = new Point3d_GL(cx + rad * Math.Cos(a), cy + rad * Math.Sin(a), start.z + (end.z - start.z) * t);
+                        e_pos = e_start + (e_end - e_start) * t;
+                        if (s_i == n) pos = end.Clone();
+                        add_move();
+                    }
+                }
+                else if (letter == 'G' && code == 4)
+                {
+                    var wait_s = get(args, 'S') + get(args, 'P') / 1000d;
+                    // плата отсчитывает паузу в тактах управления (t_coef тактов в секунду)
+                    coms.Add(new StepperFrame(1, 589, "P" + ((long)(wait_s * t_coef)).ToString()));
+                }
+                else if (letter == 'G' && code == 28)
+                {
+                    bool any = has(args, 'X') || has(args, 'Y') || has(args, 'Z');
+                    if (!any) coms.Add(new StepperFrame(1, 589, "X12"));   // все оси: Z1..Z3, затем X, Y
+                    else
+                    {
+                        if (has(args, 'Z')) { coms.Add(new StepperFrame(1, 587, "I2 H", false, 0)); coms.Add(new StepperFrame(1, 587, "I3 H", false, 0)); coms.Add(new StepperFrame(1, 587, "I4 H")); }
+                        if (has(args, 'X')) coms.Add(new StepperFrame(1, 587, "I0 H", false, has(args, 'Y') ? 0 : 1));
+                        if (has(args, 'Y')) coms.Add(new StepperFrame(1, 587, "I1 H"));
+                    }
+                }
+                else if (letter == 'G' && code == 90) { pos_rel = false; }
+                else if (letter == 'G' && code == 91) { pos_rel = true; }
+                else if (letter == 'G' && code == 92)
+                {
+                    // G92 без параметров обнуляет все оси
+                    bool none = !(has(args, 'X') || has(args, 'Y') || has(args, 'Z') || has(args, 'E'));
+                    if (has(args, 'X') || none) { var v = get(args, 'X'); p_off.x = pos.x + p_off.x - v; pos.x = v; }
+                    if (has(args, 'Y') || none) { var v = get(args, 'Y'); p_off.y = pos.y + p_off.y - v; pos.y = v; }
+                    if (has(args, 'Z') || none) { var v = get(args, 'Z'); p_off.z = pos.z + p_off.z - v; pos.z = v; }
+                    if (has(args, 'E') || none) { var v = get(args, 'E'); e_off = e_pos + e_off - v; e_pos = v; }
+                }
+                else if (letter == 'G' && code == 54)
+                {
+                    coms.Add(new StepperFrame(0, 637, ((int)get(args, 'X')).ToString()));
+                    e_shift = e_pos + e_off;
+                }
+                else if (letter == 'M' && code == 82) { extr_rel = false; }
+                else if (letter == 'M' && code == 83) { extr_rel = true; }
+                else if (letter == 'M' && (code == 106 || code == 107))
+                {
+                    var fan_ind = (int)get(args, 'P');
+                    var fan_val = code == 106 ? (int)get(args, 'S', 255) : 0;
+                    coms.Add(new StepperFrame(1, 581, "I" + fan_ind + " A" + fan_val));
+                }
+                else if (letter == 'M' && (code == 140 || code == 190 || code == 104 || code == 109))
+                {
+                    // Нагрев/охлаждение — на Octopus (M579), подробная логика будет позже.
+                    // M104/M109 T<шприц> — шприц, M140/M190 — стол. Ожидание — M109/M190.
+                    var temp_dest = get(args, 'S');
+                    int wait = (code == 190 || code == 109) ? 1 : 0;
+                    var heater = (code == 104 || code == 109) ? 1 + (int)get(args, 'T', tool_active) : 0;
+                    // S0 — выключить. Канал: N0 стол, N1..N3 шприцы
+                    coms.Add(new StepperFrame(1, 579, "N" + heater + " E" + (temp_dest != 0 ? 1 : 0) + " T" + temp_dest.ToString(System.Globalization.CultureInfo.InvariantCulture), false, wait));
+                }
+                else
+                {
+                    Console.WriteLine("G-код: строка " + (i + 1) + " пропущена (не поддерживается): " + orig_g_code[i]);
                 }
             }
 
@@ -2520,32 +2471,17 @@ namespace tcp_to_udp
             var dz = (-p_dest.x * bed_calib_vec.x - p_dest.y * bed_calib_vec.y) / bed_calib_vec.z;
             return dz;
         }
+        // Fabion: обратная задача — картезианская. Z и E — моторы активного шприца.
         public long[] solve_ik(StepperFrame frame)
         {
             if (frame.poses_have) return frame.poses;
-            var p_xyz_ik = new Point3d_GL();
-
-            var p_dest = frame.p_xyz.Clone();
-            //p_dest.z += comp_off_bed(p_dest);
-            //Console.WriteLine(p_dest);
-            var p_z = delta_ik(p_dest);
-
-            p_xyz_ik.x = p_z.x * p_xyz_steps.x;
-            p_xyz_ik.y = p_z.y * p_xyz_steps.y;
-            p_xyz_ik.z = p_z.z * p_xyz_steps.z;
-
-
-
-            //Console.WriteLine("frame.e "+frame.e + " " + e_steps);
-            var e_st = frame.e*e_steps;
-            var time_counts = frame.time_abs*t_coef;
+            var p = frame.p_xyz;
             var pos = new long[] { 0, 0, 0, 0, 0 };
-            pos[0] = (long)p_xyz_ik.x;
-            pos[1] = (long)p_xyz_ik.y;
-            pos[2] = (long)p_xyz_ik.z;
-            pos[3] = (long)e_st;
-            pos[4] = (long)time_counts;
-
+            pos[0] = (long)Math.Round(p.x * steps_mm(0));
+            pos[1] = (long)Math.Round(p.y * steps_mm(1));
+            pos[2] = (long)Math.Round(p.z * steps_mm(z_motor()));
+            pos[3] = (long)Math.Round(frame.e * steps_mm(e_motor()));
+            pos[4] = (long)(frame.time_abs * t_coef);
             return pos;
         }
         static public double cos(double x)
@@ -2898,33 +2834,15 @@ namespace tcp_to_udp
         }
 
         
+        // Fabion: прямая задача — картезианская. pos = { X, Y, Z активного, E активного } в шагах
         public StepperFrame solve_fk(long[] pos)
         {
-            var pos_comp = (long[])pos.Clone();
-            var p_xyz_fk = new Point3d_GL(0,0,0);
-
-
-
-
-            var a_z = pos[0] / p_xyz_steps.x;
-            var b_z = pos[1] / p_xyz_steps.y;
-            var c_z = pos[2] / p_xyz_steps.z;
-            var dest_abc = new Point3d_GL(a_z, b_z, c_z);
-            var p_start = comp_delta_fk_table(dest_abc);
-            var p_fit = comp_delta_fitting(p_start, dest_abc);
-            var p_fit2 = comp_delta_fitting(p_fit[1], dest_abc);
-            var p_fit3 = comp_delta_fitting(p_fit2[1], dest_abc);
-            var p_fit4 = comp_delta_fitting(p_fit3[1], dest_abc);
-            
-            var e_fk = e_steps / e_steps;
-            if (pos.Length>3)
-            {
-                e_fk = pos[3] / e_steps;
-            }
-
-                return new StepperFrame(p_fit4[1], e_fk, 0);
+            var x = pos[0] / steps_mm(0);
+            var y = pos[1] / steps_mm(1);
+            var z = pos[2] / steps_mm(z_motor());
+            var e = pos.Length > 3 ? pos[3] / steps_mm(e_motor()) : 0;
+            return new StepperFrame(new Point3d_GL(x, y, z), e, 0);
         }
-       
 
         public double max_printing_radius(double offs = 1)
         {
@@ -3579,7 +3497,7 @@ namespace tcp_to_udp
                 {
                     cur_pos[4] = (long)(cur_pos[4] / printer.koef_vel);
                 }
-                var com = "num" + plate_num + " M588 X" + cur_pos[0] + " Y" + cur_pos[1] + " Z" + cur_pos[2] + " E" + (long)(printer.abs_pos_extr * printer.e_steps) + " W" + cur_pos[4] + " I" + prog_number + " J" + line_number;
+                var com = "num" + plate_num + " M588 X" + cur_pos[0] + " Y" + cur_pos[1] + " Z" + cur_pos[2] + " E" + (long)(printer.abs_pos_extr * printer.steps_mm(printer.e_motor())) + " W" + cur_pos[4] + " I" + prog_number + " J" + line_number;
                 return com;
 
 

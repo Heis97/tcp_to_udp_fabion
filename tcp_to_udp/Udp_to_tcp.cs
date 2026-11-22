@@ -109,13 +109,8 @@ namespace tcp_to_udp
             udp_addres_1 = new IPEndPoint(IPAddress.Parse(ip1), port_udp1);
             udp_client1.Connect(udp_addres_1);
 
+            // Fabion: одна плата (Octopus, NUM_BOARD 1). Плата 2 не используется.
             udp_client2 = null;
-            GC.Collect();
-            udp_client2 = new UdpClient(50001);
-            string ip2 = "192.168.10.211";
-            var port_udp2 = 52100;
-            udp_addres_2 = new IPEndPoint(IPAddress.Parse(ip2), port_udp2);
-            udp_client2.Connect(udp_addres_2);
 
 
             
@@ -155,7 +150,8 @@ namespace tcp_to_udp
             Console.WriteLine("1 " + commands1.Count);
 
             //Console.WriteLine("start con done");
-            for (int i = 0; i < 3; i++) cams_thr[i] = start_cam(i, ports_cam[i]);
+            // Fabion: камер нет
+            //for (int i = 0; i < 3; i++) cams_thr[i] = start_cam(i, ports_cam[i]);
             while (true)
             {
                 string? input = Console.ReadLine();
@@ -218,10 +214,8 @@ namespace tcp_to_udp
                     }
                     else if (command.Contains("num2"))
                     {
-                        //Console.WriteLine("add com2: " + command);
-                        var com_board = command.Replace("num2", "").Trim();
-                        commands2.Add(new Command(command_counter2, com_board));
-                        command_counter2++;
+                        // Fabion: платы 2 нет — иначе очередь commands2 никогда не опустеет и шлюз встанет
+                        Console.WriteLine("Плата 2 отсутствует, команда пропущена: " + command);
                     }
                     else if (command.Contains("main"))
                     {
@@ -260,12 +254,6 @@ namespace tcp_to_udp
                     }
                 }
             }
-            else if (command.Contains("M592"))
-            {
-                var auto_set_cams = new Thread(auto_setup_cams);
-                auto_set_cams.Start();
-            }
-
             else if (command.Contains("M593"))
             {
 
@@ -367,21 +355,6 @@ namespace tcp_to_udp
                 printer.tool_calibrated_manual[printer.tool_active] = true;
 
             }
-            else if (command.Contains("M613"))//
-            {
-
-                var val = val_from_command(com_board);
-                //
-                if (val <= 4) { val = 4; printer.delta_init_calibr(StepperPrinter.delta_calibr_ps_count.ps4); }
-                else { val = 18; printer.delta_init_calibr(StepperPrinter.delta_calibr_ps_count.ps18); }
-
-                load_commands(new string[] { "main M589 X80" });
-               
-
-                printer.delta_calibr_en = true;
-
-                // Console.WriteLine("printer.delta_calibr_en = true;");
-            }
             else if (command.Contains("M614"))//settings load
             {
 
@@ -450,187 +423,44 @@ namespace tcp_to_udp
             }
 
 
-            else if (command.Contains("M619"))
+            //---------------- Fabion: шприцы ----------------
+            // M620 n — сделать активным шприц n (0..2): поднять Z текущего шприца в парковку,
+            //          дальше программы ведут Z и E шприца n.
+            // M621   — поднять в парковку все три Z.
+            // M622 n — поднять в парковку Z шприца n.
+            else if (command.Contains("M620"))
             {
-                var val = val_from_command(com_board);
-
-
-                //i3 vert, i4 rot, 
-                printer.cur_coordinate_system = StepperPrinter.coordinate_system.INTERNAL; 
-                printer.offset_frame = printer.comp_offset(printer.cur_coordinate_system);
-                StepperFrame[] prog_cur = null;
-                prog_cur = StepperPrinter.gen_change_prog(val, printer.settins_string, printer.cur_frame.clone(),printer.safe_z_internal);
-                
-                if(prog_cur!=null) printer.start_alternate_prog(prog_cur);
-            }
-
-            else if (command.Contains("M620")) // take i tool
-            {
-                printer.cur_coordinate_system = StepperPrinter.coordinate_system.INTERNAL;
-                printer.offset_frame = printer.comp_offset(printer.cur_coordinate_system);
-                var prog_cur = new List<StepperFrame>();
-
-                var val = val_from_command(com_board);
-                var tool_dest = val;
-                
-                var manip_left = printer.tool_inds[0];
-                var manip_right = printer.tool_inds[1];
-
-                var last_frame = printer.cur_frame.clone();
-
-                if (manip_left != tool_dest && manip_right != tool_dest && printer.tool_active != tool_dest) Console.WriteLine("Вставте экструдер: " + tool_dest);
-                if (printer.tool_active != 0)
+                var tool_dest = val_from_command(com_board);
+                if (tool_dest < 0 || tool_dest >= StepperPrinter.TOOLS_COUNT)
                 {
-                    int prog_num_give = -1;
-                    if (manip_left == 0)
-                    {
-                        prog_num_give = 1;
-                    }
-                    if (manip_right == 0)
-                    {
-                        prog_num_give = 3;
-                    }
-                    if(prog_num_give<=0)
-                    {
-                        Console.WriteLine("Нет свободного места: Текущий экструдер: " + printer.tool_active + "; Манипулятор левый: " + manip_left + "; Манипулятор правый: " + manip_right);
-                        printer.main_alternately_commands_exec = false;
-                        printer.prog_state = StepperPrinter.programm_state.STOP;
-                          
-                        return;
-
-                    }
-                    else
-                    {
-                        prog_cur.AddRange(StepperPrinter.gen_change_prog(prog_num_give, printer.settins_string, last_frame.clone(), printer.safe_z_internal));
-                        last_frame = StepperFrame.find_last_kinematic_frame(prog_cur.ToArray());
-                        if (last_frame == null) return;
-                    }
-                }
-
-                int prog_num_take = -1;
-                if(manip_left == tool_dest)
-                {
-                    prog_num_take = 0;
-                }
-                if (manip_right == tool_dest)
-                {
-                    prog_num_take = 2;
-                }
-                if (prog_cur != null && prog_num_take>=0)  prog_cur.AddRange(StepperPrinter.gen_change_prog(prog_num_take, printer.settins_string, last_frame.clone(), printer.safe_z_internal));
-
-                if (prog_cur != null)
-                {
-                    printer.tool_active = tool_dest;
-                    printer.start_alternate_prog(prog_cur.ToArray());
-                }
-                
-            }
-
-            else if (command.Contains("M621")) //drop active tool
-            {
-                printer.cur_coordinate_system = StepperPrinter.coordinate_system.INTERNAL;
-                printer.offset_frame = printer.comp_offset(printer.cur_coordinate_system);
-                var prog_cur = new List<StepperFrame>();
-                var last_frame = printer.cur_frame.clone();
-                int prog_num_give = -1;
-                var manip_left = printer.tool_inds[0];
-                var manip_right = printer.tool_inds[1];
-                if (manip_left == 0)
-                {
-                    prog_num_give = 1;
-                }
-                if (manip_right == 0)
-                {
-                    prog_num_give = 3;
-                }
-                if (prog_num_give <= 0)
-                {
-                    Console.WriteLine("Нет свободного места: Текущий экструдер: " + printer.tool_active + "; Манипулятор левый: " + manip_left + "; Манипулятор правый: " + manip_right);
-                    printer.main_alternately_commands_exec = false;
-                    printer.prog_state = StepperPrinter.programm_state.STOP;
+                    Console.WriteLine("M620: нет шприца " + tool_dest);
                     return;
                 }
-                else
-                {
-                    prog_cur.AddRange(StepperPrinter.gen_change_prog(prog_num_give, printer.settins_string, last_frame.clone(), printer.safe_z_internal) );
-                    if (prog_cur != null) printer.start_alternate_prog(prog_cur.ToArray());
-                }
+                var prog_cur = new List<StepperFrame>();
+                if (tool_dest != printer.tool_active)
+                    prog_cur.Add(park_z_frame(printer.tool_active, true));
+                printer.tool_active = tool_dest;
+                printer.set_all_pos(printer.all_pos);
+                printer.cur_frame = printer.solve_fk(printer.cur_pos);
+                printer.cur_frame.p_xyz.z -= printer.comp_off_bed(printer.cur_frame.p_xyz);
+                prog_cur.Add(new StepperFrame(1, 588, "K" + printer.z_motor() + " L" + printer.e_motor(), false));
+                printer.cur_coordinate_system = printer.dest_coordinate_system;
+                printer.offset_frame = printer.comp_offset(printer.cur_coordinate_system);
+                printer.start_alternate_prog(prog_cur.ToArray());
+                Console.WriteLine("Активный шприц: " + (tool_dest + 1));
             }
-
+            else if (command.Contains("M621"))
+            {
+                var prog_cur = new List<StepperFrame>();
+                for (int t = 0; t < StepperPrinter.TOOLS_COUNT; t++)
+                    prog_cur.Add(park_z_frame(t, t == StepperPrinter.TOOLS_COUNT - 1));
+                printer.start_alternate_prog(prog_cur.ToArray());
+            }
             else if (command.Contains("M622"))
             {
-
-
-
-            }
-
-            else if (command.Contains("M623"))//set bring tablet
-            {
-
-                var prog_cur = new List<StepperFrame>();
-                if(printer.cover_up)
-                {
-                    prog_cur.Add(new StepperFrame(2, 577, "I0 V" + printer.settins_string.servo_open_val, false));
-                    prog_cur.Add(new StepperFrame(2, 577, "I1 V" + (180 - printer.settins_string.servo_open_val), false));
-                    prog_cur.Add(new StepperFrame(2, 587, "I0 P" + printer.settins_string.table_change_pos + " L", false));
-                    prog_cur.Add(new StepperFrame(2, 587, "I2 P" + printer.settins_string.lift_up_val + " L", false));
-                    prog_cur.Add(new StepperFrame(2, 577, "I0 V" + printer.settins_string.servo_close_val, false));
-                    prog_cur.Add(new StepperFrame(2, 577, "I1 V" + (180 - printer.settins_string.servo_close_val), false));
-                    prog_cur.Add(new StepperFrame(2, 587, "I2 H"));
-                    prog_cur.Add(new StepperFrame(2, 587, "I0 P" + printer.settins_string.table_work_pos + " L", false));
-                }
-                else
-                {
-                    prog_cur.Add(new StepperFrame(2, 587, "I0 H", false));
-                    prog_cur.Add(new StepperFrame(2, 587, "I0 P" + printer.settins_string.table_work_pos + " L", false));
-
-                }
-                
-                printer.start_alternate_prog(prog_cur.ToArray());
-            }
-
-            else if (command.Contains("M624"))//set give tablet
-            {
-                var prog_cur = new List<StepperFrame>();
-                if (printer.cover_up)
-                {
-
-                    prog_cur.Add(new StepperFrame(2, 587, "I0 P" + printer.settins_string.table_change_pos + " L", false));
-                    prog_cur.Add(new StepperFrame(2, 587, "I2 P" + printer.settins_string.lift_up_val + " L", false));
-                    prog_cur.Add(new StepperFrame(2, 577, "I0 V" + printer.settins_string.servo_open_val, false));
-                    prog_cur.Add(new StepperFrame(2, 577, "I1 V" + (180 - printer.settins_string.servo_open_val), false));
-                    prog_cur.Add(new StepperFrame(2, 587, "I2 H", false));
-                    prog_cur.Add(new StepperFrame(2, 587, "I0 P" + printer.settins_string.table_open_pos + " L", false));
-                }
-                else
-                {
-                    prog_cur.Add(new StepperFrame(2, 587, "I0 H", false));
-                    prog_cur.Add(new StepperFrame(2, 587, "I0 P" + printer.settins_string.table_open_pos + " L", false));
-
-                }
-                printer.start_alternate_prog(prog_cur.ToArray());
-            }
-            else if (command.Contains("M630"))//home manipulators
-            {
-
-                var prog_cur = new List<StepperFrame>();
-                prog_cur.Add(new StepperFrame(2, 587, "I3 S50 L", false, 0));
-                prog_cur.Add(new StepperFrame(2, 587, "I4 S50 L", false, 0));
-                prog_cur.Add(new StepperFrame(2, 587, "I5 S50 L", false, 0));
-                prog_cur.Add(new StepperFrame(2, 587, "I6 S50 L", false));
-
-                prog_cur.Add(new StepperFrame(2, 587, "I3 H", false, 0));
-                prog_cur.Add(new StepperFrame(2, 587, "I4 H", false, 0));
-                prog_cur.Add(new StepperFrame(2, 587, "I5 H", false, 0));
-                prog_cur.Add(new StepperFrame(2, 587, "I6 H", false));
-
-                prog_cur.Add(new StepperFrame(2, 587, "I4 P" + printer.settins_string.take_left_manip_rot[4] + " L", false, 0));
-                prog_cur.Add(new StepperFrame(2, 587, "I3 P100 L", false, 0));
-                prog_cur.Add(new StepperFrame(2, 587, "I6 P" + printer.settins_string.take_right_manip_rot[4] + " L", false, 0));
-                prog_cur.Add(new StepperFrame(2, 587, "I5 P100 L", false));
-
-                printer.start_alternate_prog(prog_cur.ToArray());
-
+                var t = val_from_command(com_board);
+                if (t >= 0 && t < StepperPrinter.TOOLS_COUNT)
+                    printer.start_alternate_prog(new StepperFrame[] { park_z_frame(t, true) });
             }
             else if (command.Contains("M631"))//set xy_calibrate
             {
@@ -668,83 +498,6 @@ namespace tcp_to_udp
             }
 
 
-            else if (command.Contains("M634"))//home osc
-            {
-
-                var prog_cur = new List<StepperFrame>();
-                prog_cur.Add(new StepperFrame(1, 587, "I3 S50 L", false,0));
-                prog_cur.Add(new StepperFrame(1, 587, "I4 S50 L", false, 0));
-                prog_cur.Add(new StepperFrame(1, 587, "I5 S50 L", false, 0));
-                prog_cur.Add(new StepperFrame(1, 587, "I6 S50 L", false));
-
-                prog_cur.Add(new StepperFrame(1, 587, "I3 H", false, 0));
-                prog_cur.Add(new StepperFrame(1, 587, "I4 H", false, 0));
-                prog_cur.Add(new StepperFrame(1, 587, "I5 H", false, 0));
-                prog_cur.Add(new StepperFrame(1, 587, "I6 H", false));
-
-                prog_cur.Add(new StepperFrame(1, 587, "I3 P-50 L", false, 0));
-                prog_cur.Add(new StepperFrame(1, 587, "I4 P"+ printer.settins_string.osc_rot_start_pos1+" L", false, 0));
-                prog_cur.Add(new StepperFrame(1, 587, "I5 P-50 L", false, 0));
-                prog_cur.Add(new StepperFrame(1, 587, "I6 P"+ printer.settins_string.osc_rot_start_pos2+" L", false));
-
-                printer.start_alternate_prog(prog_cur.ToArray());
-
-            }
-
-            else if (command.Contains("M635"))//home osc
-            {
-
-                var prog_cur = new List<StepperFrame>();
-
-                //prog_cur.Add(new StepperFrame(1, 589, "X10"));
-                prog_cur.Add(new StepperFrame(0, 631, ""));
-
-                prog_cur.Add(new StepperFrame(0, 637, "1"));
-                //prog_cur.Add(new StepperFrame(0, 638, "-41.8732 67.1863 -394.5207"));
-                //prog_cur.Add(new StepperFrame(0, 632, "1"));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0,0,50),0, printer.jog_xyz_vel));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0, 10, 50), 0, printer.jog_xyz_vel));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(10, 10, 50), 0, printer.jog_xyz_vel));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(10, 0, 50), 0, printer.jog_xyz_vel));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0, 0, 50), 0, printer.jog_xyz_vel));
-                prog_cur.Add(new StepperFrame(0, 619, "1"));
-
-
-                /*var prog_cur = new List<StepperFrame>();
-
-                //prog_cur.Add(new StepperFrame(1, 589, "X10"));
-                //prog_cur.Add(new StepperFrame(0, 631, ""));
-
-                //prog_cur.Add(new StepperFrame(0, 637, "1"));
-                //prog_cur.Add(new StepperFrame(0, 638, "-41.8732 67.1863 -394.5207"));
-                //prog_cur.Add(new StepperFrame(0, 632, "1"));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0, 0, -292), 0, 2));
-                prog_cur.Add(new StepperFrame(1, 589, "P500000"));
-                //prog_cur.Add(new StepperFrame(1, 589, "P500000"));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0, 0, -293.4), 0, 2));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0, 0, -294.4), 0, 2));
-                prog_cur.Add(new StepperFrame(1, 589, "P500000"));
-                prog_cur.Add(new StepperFrame(1, 587, "I3 S300 L", false));
-                prog_cur.Add(new StepperFrame(0, 0, 0, 0, 1, 0));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0, 0, -292), 0, 2));
-                prog_cur.Add(new StepperFrame(1, 589, "P500000"));
-                prog_cur.Add(new StepperFrame(0, 0, 0, 0, 1, 0));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0, 0, -293.4), 0, 2));
-                prog_cur.Add(new StepperFrame(1, 589, "P200000"));
-                prog_cur.Add(new StepperFrame(0, 0, 0, 0, 1, 0));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0, 0, -292), 0, 2));
-                prog_cur.Add(new StepperFrame(1, 589, "P200000"));
-                prog_cur.Add(new StepperFrame(0, 0, 0, 0, 1, 0));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0, 0, -293.4), 0, 2));
-                prog_cur.Add(new StepperFrame(1, 589, "P200000"));
-                prog_cur.Add(new StepperFrame(new Point3d_GL(0, 0, -292.0), 0, 2));
-                prog_cur.Add(new StepperFrame(0, 0, 0, 0, 1, 0));*/
-
-                printer.start_main_alternate_prog(prog_cur.ToArray());
-
-            }
-
-
             else if (command.Contains("M636"))
             {
                 var val = val_from_command(com_board);
@@ -768,9 +521,14 @@ namespace tcp_to_udp
             }
             else if (command.Contains("M639"))
             {
+                // активный шприц без движения (например, после ручной смены)
                 var val = val_from_command(com_board);
-                printer.tool_active = val;
-
+                if (val >= 0 && val < StepperPrinter.TOOLS_COUNT)
+                {
+                    printer.tool_active = val;
+                    printer.set_all_pos(printer.all_pos);
+                    load_commands(new string[] { "num1 M588 K" + printer.z_motor() + " L" + printer.e_motor() });
+                }
             }
             else if (command.Contains("M640"))
             {
@@ -818,7 +576,6 @@ namespace tcp_to_udp
             {
                 printer.prog_state =  StepperPrinter.programm_state.STOP;
                 _TCPserver1.pushBuffer_in("num1 M589 S" + "\n");
-                _TCPserver1.pushBuffer_in("num2 M589 S" + "\n");
                 printer.calibrating_nossle = false;
                 printer.main_alternately_commands_counter = printer.main_alternately_commands.Count + 1;
             }
@@ -849,10 +606,8 @@ namespace tcp_to_udp
 
 
 
-            var max_print_r = printer.max_printing_radius();
-            Console.WriteLine("max_print_r: " + max_print_r);
+            // Fabion: картезианская кинематика, таблица дельты не нужна
             printer.bed_calib_vec = printer.bed_calib_vec.normalize();
-            printer.comp_delta_table(max_print_r);
 
             /*var prog_orig_commands = new List<string>()
             {
@@ -980,8 +735,8 @@ namespace tcp_to_udp
                             var frame_out = printer.cur_frame.p_xyz.Clone();
                             //frame_out.z -= printer.comp_off_bed(frame_out);
                             
-                            var tools = "00000";
-                            if (printer.tool_inds.Length == 4) tools = printer.tool_inds[0] + "" + printer.tool_inds[1] + "" + printer.tool_inds[2] + "" + printer.tool_inds[3] + "" + printer.tool_active;
+                            // Fabion: последняя цифра — активный шприц (0..2), остальные не используются
+                            var tools = "0000" + printer.tool_active;
 
                             var offs_intern = printer.comp_offset(StepperPrinter.coordinate_system.INTERNAL).p_xyz;
 
@@ -991,7 +746,10 @@ namespace tcp_to_udp
                             var frame_out_mash = frame_out.Clone() - offs_intern;
                             var frame_out_tool = frame_out.Clone() - printer.comp_offset(printer.dest_coordinate_system).p_xyz;
 
-                            _TCPserver1.pushBuffer(mes + " " + tools + " " + frame_out_cur.ToString() + " " + frame_out_mash.ToString() + " " + frame_out_tool.ToString() +" "+printer.cur_coordinate_system+ "\n");
+                            _TCPserver1.pushBuffer(mes + " " + tools + " " + frame_out_cur.ToString() + " " + frame_out_mash.ToString() + " " + frame_out_tool.ToString() +" "+printer.cur_coordinate_system+
+                                // Fabion: машинные координаты Z1 Z2 Z3 E1 E2 E3 (мм)
+                                " " + fmt_mm(printer.motor_mm(2)) + " " + fmt_mm(printer.motor_mm(3)) + " " + fmt_mm(printer.motor_mm(4)) +
+                                " " + fmt_mm(printer.motor_mm(5)) + " " + fmt_mm(printer.motor_mm(6)) + " " + fmt_mm(printer.motor_mm(7)) + "\n");
                         }
                         //Console.WriteLine(mes);
                         // Console.WriteLine("len1: " + coms1.Count);
@@ -1013,6 +771,7 @@ namespace tcp_to_udp
                                     printer.all_steps_kinem = Convert.ToInt32(vars_from_mes[4][1]) - 48;
                                     printer.ring_buf_en = Convert.ToInt32(vars_from_mes[4][2]) - 48;
                                     printer.wait_en = Convert.ToInt32(vars_from_mes[4][3]) - 48;
+                                    printer.wait_term = Convert.ToInt32(vars_from_mes[4][4]) - 48;   // Fabion: нагрев на этой же плате
 
                                     //Console.WriteLine("1:" + vars_from_mes[4]);
                                 }
@@ -1032,36 +791,7 @@ namespace tcp_to_udp
                                     printer.calibr_y = Convert.ToInt32(nossle_calib_vals[1]) - 48;
                                     printer.calibr_z = Convert.ToInt32(nossle_calib_vals[2]) - 48;
 
-                                    var tool_recogn_vals = vars_from_mes[11];
-                                    if (tool_recogn_vals.Length == 8)
-                                    {
-                                        var tool0_0 = Convert.ToInt32(tool_recogn_vals[0]) - 48;
-                                        var tool0_1 = Convert.ToInt32(tool_recogn_vals[1]) - 48;
-                                        var tool0_2 = Convert.ToInt32(tool_recogn_vals[2]) - 48;
-
-                                        var tool1_0 = Convert.ToInt32(tool_recogn_vals[3]) - 48;
-                                        var tool1_1 = Convert.ToInt32(tool_recogn_vals[4]) - 48;
-                                        var tool1_2 = Convert.ToInt32(tool_recogn_vals[5]) - 48;
-
-                                        var tool2_0 = Convert.ToInt32(tool_recogn_vals[6]) - 48;
-                                        var tool3_0 = Convert.ToInt32(tool_recogn_vals[7]) - 48;
-
-                                        printer.tool_inds = new int[] { 0, 0, 0, 0 };
-
-                                        if (tool0_0 == 0) printer.tool_inds[0] = 1;
-                                        if (tool0_1 == 0) printer.tool_inds[0] = 2;
-                                        if (tool0_2 == 0) printer.tool_inds[0] = 3;
-
-                                        if (tool1_0 == 0) printer.tool_inds[1] = 1;
-                                        if (tool1_1 == 0) printer.tool_inds[1] = 2;
-                                        if (tool1_2 == 0) printer.tool_inds[1] = 3;
-
-                                        if (tool2_0 == 0) printer.tool_inds[2] = 1;
-                                        if (tool3_0 == 0) printer.tool_inds[3] = 1;
-
-
-                                    }
-
+                                    // Fabion: датчиков головок нет
                                 }
                                 var cur_prog_line_board = Convert.ToInt64(vars_from_mes[2]);
                                 //cur position-----------------------------------------------------------------
@@ -1074,7 +804,8 @@ namespace tcp_to_udp
                                     }
 
 
-                                    printer.cur_pos = new long[] { cur_poses[0], cur_poses[1], cur_poses[2], cur_poses[7] };
+                                    // Fabion: X, Y, Z и E активного шприца
+                                    printer.set_all_pos(cur_poses);
 
                                     printer.cur_frame = printer.solve_fk(printer.cur_pos);
 
@@ -1211,11 +942,12 @@ namespace tcp_to_udp
 
                                 //delta calib_handler-----------------------------------------------------------------
 
-                                var cur_delta_calib = Convert.ToInt32(vars_from_mes[8]);//!!!!!!!cur_send ==0
-                                var cur_ring_buf_en = Convert.ToInt32(vars_from_mes[9]);
-                                var cur_homing = Convert.ToInt32(vars_from_mes[10]);
+                                // Fabion: калибровки дельты нет (M613 убрана), delta_calibr_en всегда false
                                 if (printer.delta_calibr_en)
                                 {
+                                var cur_delta_calib = Convert.ToInt32(vars_from_mes[8]);
+                                var cur_ring_buf_en = Convert.ToInt32(vars_from_mes[9]);
+                                var cur_homing = Convert.ToInt32(vars_from_mes[10]);
 
 
 
@@ -1296,8 +1028,7 @@ namespace tcp_to_udp
 
                                 }
 
-                                printer.prev_delta_calib = cur_delta_calib;
-                                printer.prev_homing = cur_homing;
+                                // (prev_delta_calib / prev_homing — только для дельты, не нужны)
                                 // Console.WriteLine(mes);
                                 printer.prev_pos = (long[])printer.cur_pos.Clone();
 
@@ -1630,62 +1361,56 @@ namespace tcp_to_udp
 
         public void load_settings()
         {
-            printer.settins_string = load_obj<SettingsString>("settings_printer.json");
-
-
-
-            for (int i = 0; i<printer.settins_string.motors_count1;i++)
+            var st = load_obj<SettingsString>("settings_printer.json");
+            if (st == null)
             {
-                
-                _TCPserver1.pushBuffer_in("num1 M587" + 
-                    " I" + i + 
-                    " A" + Math.Round(printer.settins_string.a_max1[i],3) +
-                    " V" + Math.Round(printer.settins_string.v_def1[i], 3) +
-                    " E" + printer.settins_string.end_inv1[i] +
-                    " D" + printer.settins_string.motor_dir1[i] +
-                    " R" + printer.settins_string.steps_per_mm1[i] +
-                    " K" + printer.settins_string.home_dir1[i] +
-                    "\n");
+                Console.WriteLine("settings_printer.json не найден или повреждён — создаю с настройками по умолчанию");
+                st = new SettingsString();
             }
+            st.fill_missing();
+            printer.settins_string = st;
+            st.apply_planner_settings();
 
-            for (int i = 0; i<printer.settins_string.motors_count1;i++)
+            // Fabion: одна плата, 8 моторов: 0 X, 1 Y, 2..4 Z1..Z3, 5..7 E1..E3
+            for (int i = 0; i < st.motors_count1; i++)
             {
-                
-                _TCPserver1.pushBuffer_in("num1 M587" + 
-                    " I" + i + 
-                    " X" + printer.settins_string.soft_min_pos1[i] +
-                    " Y" + printer.settins_string.soft_max_pos1[i] +
-                    " Z1"+
-                    "\n");
-            }
-
-            for (int i = 0; i < printer.settins_string.motors_count2; i++)
-            {
-                _TCPserver1.pushBuffer_in("num2 M587" +
+                _TCPserver1.pushBuffer_in("num1 M587" +
                     " I" + i +
-                    " A" + Math.Round(printer.settins_string.a_max2[i], 3) +
-                    " V" + Math.Round(printer.settins_string.v_def2[i], 3) +
-                    " E" + printer.settins_string.end_inv2[i] +
-                    " D" + printer.settins_string.motor_dir2[i] +
-                    " R" + printer.settins_string.steps_per_mm2[i] +
-                    " K" + printer.settins_string.home_dir2[i] +
+                    " A" + Math.Round(st.a_max1[i], 3) +
+                    " V" + Math.Round(st.v_def1[i], 3) +
+                    " E" + st.end_inv1[i] +
+                    " D" + st.motor_dir1[i] +
+                    " R" + st.steps_per_mm1[i] +
+                    " K" + st.home_dir1[i] +
                     "\n");
             }
-            for (int i = 0; i < printer.settins_string.motors_count2; i++)
+            for (int i = 0; i < st.motors_count1; i++)
             {
-
-                _TCPserver1.pushBuffer_in("num2 M587" +
+                _TCPserver1.pushBuffer_in("num1 M587" +
                     " I" + i +
-                    " X" + printer.settins_string.soft_min_pos2[i] +
-                    " Y" + printer.settins_string.soft_max_pos2[i] +
+                    " X" + st.soft_min_pos1[i] +
+                    " Y" + st.soft_max_pos1[i] +
                     " Z1" +
                     "\n");
             }
-
-            _TCPserver1.pushBuffer_in("num1 M581 I2 A0\n");
-            save_obj("settings_printer.json", printer.settins_string);
-
+            // активный шприц в буфере платы
+            _TCPserver1.pushBuffer_in("num1 M588 K" + printer.z_motor() + " L" + printer.e_motor() + "\n");
+            save_obj("settings_printer.json", st);
         }
+
+        // Кадр «поднять Z шприца tool в парковку» (машинные мм, settings: z_park_mm)
+        StepperFrame park_z_frame(int tool, bool wait)
+        {
+            var zm = printer.z_motor(tool);
+            var z = printer.settins_string.z_park_mm[Math.Clamp(tool, 0, StepperPrinter.TOOLS_COUNT - 1)];
+            return new StepperFrame(1, 587, "I" + zm + " P" + z.ToString(System.Globalization.CultureInfo.InvariantCulture), false, wait ? 1 : 0);
+        }
+
+        static string fmt_mm(double v)
+        {
+            return Math.Round(v, 3).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
         static int val_from_command(string cmd)
         {
             var command_af = cmd.Replace("  ", " ");
@@ -1939,7 +1664,10 @@ namespace tcp_to_udp
         public int[] soft_max_pos1;
         public int[] soft_min_pos1;
 
-        public int motors_count2 = 8;
+        public int motors_count2 = 0;   // Fabion: платы 2 нет
+
+        // Fabion: высота парковки Z1..Z3 (машинные мм) — куда поднимается неактивный шприц
+        public double[] z_park_mm;
 
         public double[] a_max2;
         public double[] v_def2;
@@ -2046,6 +1774,29 @@ namespace tcp_to_udp
                 home_dir2[i]  = 1;
                 home_pos2[i]  = 0;
             }
+        }
+
+        // Fabion: заполнить отсутствующие в json поля значениями по умолчанию
+        public void fill_missing()
+        {
+            int n = motors_count1;
+            double[] D(double[] a, double v) { if (a != null && a.Length >= n) return a; var r = new double[n]; for (int i = 0; i < n; i++) r[i] = (a != null && i < a.Length) ? a[i] : v; return r; }
+            int[] I(int[] a, int v) { if (a != null && a.Length >= n) return a; var r = new int[n]; for (int i = 0; i < n; i++) r[i] = (a != null && i < a.Length) ? a[i] : v; return r; }
+            a_max1 = D(a_max1, 2); v_def1 = D(v_def1, 2);
+            end_inv1 = I(end_inv1, 0); motor_dir1 = I(motor_dir1, 1); steps_per_mm1 = I(steps_per_mm1, 100);
+            home_dir1 = I(home_dir1, 1); home_pos1 = I(home_pos1, 0);
+            soft_min_pos1 = I(soft_min_pos1, 0); soft_max_pos1 = I(soft_max_pos1, 100000);
+            if (z_park_mm == null || z_park_mm.Length < 3) z_park_mm = new double[] { 0, 0, 0 };
+            if (calibrate_nossle_x == null || calibrate_nossle_x.Length < 3) calibrate_nossle_x = new double[] { 0, 0, 0 };
+            if (calibrate_nossle_y == null || calibrate_nossle_y.Length < 3) calibrate_nossle_y = new double[] { 0, 0, 0 };
+            if (calibrate_nossle_z == null || calibrate_nossle_z.Length < 3) calibrate_nossle_z = new double[] { 0, 0, 0 };
+            if (calibrate_nossles_offset_z == null) calibrate_nossles_offset_z = new double[] { 0, 0, 0 };
+            if (offset_plate_x == null || offset_plate_x.Length < 4) offset_plate_x = new double[] { 0, 0, 0, 0 };
+            if (offset_plate_y == null || offset_plate_y.Length < 4) offset_plate_y = new double[] { 0, 0, 0, 0 };
+            if (offset_plate_z == null || offset_plate_z.Length < 4) offset_plate_z = new double[] { 0, 0, 0, 0 };
+            if (max_acs <= 0) max_acs = 50;
+            if (max_r <= 0) max_r = 0.3;
+            if (min_dist <= 0) min_dist = 0.1;
         }
 
         public void apply_planner_settings()
