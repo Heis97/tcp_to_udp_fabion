@@ -128,8 +128,8 @@ namespace tcp_to_udp
 
 
             _TCPserver1 = new TCPserver(62000);
-            server_thread1 = new Thread(_TCPserver1.startServer);
-            server_thread1.Start();
+            //server_thread1 = new Thread(_TCPserver1.startServer);
+           // server_thread1.Start();
 
             /*var coms_str = StepperFrame.test();
             for (int i = 0; i < coms_str.Length; i++)
@@ -726,7 +726,7 @@ namespace tcp_to_udp
 
                     //Console.WriteLine(DateTime.Now.Ticks);
                     var mes = Encoding.ASCII.GetString(res);
-                    //Console.WriteLine("res1: " + mes);
+                    Console.WriteLine("res1: " + mes);
                     if (res != null)
                     {
                         if (_TCPserver1.connected)
