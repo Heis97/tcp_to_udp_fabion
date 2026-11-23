@@ -113,7 +113,7 @@ namespace tcp_to_udp
             udp_client2 = null;
 
 
-            
+
 
 
             //commands1.Add(new Command(coms_str.Length + 1, "M588 A1"));
@@ -122,14 +122,13 @@ namespace tcp_to_udp
             commands1.Add(new Command(100, "M588 A1"));
             commands1.Add(new Command(101, "M588 A1"));*/
 
-            udp_thread = new Thread(recieve_udp_all);
-            udp_thread.Start();
-
-
-
             _TCPserver1 = new TCPserver(62000);
             server_thread1 = new Thread(_TCPserver1.startServer);
             server_thread1.Start();
+
+            udp_thread = new Thread(recieve_udp_all);
+            udp_thread.IsBackground = true;
+            udp_thread.Start();
 
             /*var coms_str = StepperFrame.test();
             for (int i = 0; i < coms_str.Length; i++)
@@ -594,8 +593,26 @@ namespace tcp_to_udp
 
             }
         }
-
         void recieve_udp_all()
+        {
+            while (true)
+            {
+                try
+                {
+                    recieve_udp_all_loop();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Ошибка в цикле приёма UDP: " + ex);
+                    Console.ResetColor();
+                    Thread.Sleep(500);
+                }
+            }
+        }
+
+        void recieve_udp_all_loop()
         {
             int count_ins = 0;
 
@@ -726,7 +743,7 @@ namespace tcp_to_udp
 
                     //Console.WriteLine(DateTime.Now.Ticks);
                     var mes = Encoding.ASCII.GetString(res);
-                    Console.WriteLine("res1: " + mes);
+                    //Console.WriteLine("res1: " + mes);
                     if (res != null)
                     {
                         if (_TCPserver1.connected)
@@ -1390,7 +1407,7 @@ namespace tcp_to_udp
                     " I" + i +
                     " X" + st.soft_min_pos1[i] +
                     " Y" + st.soft_max_pos1[i] +
-                    " Z1" +
+                    " Z0" +
                     "\n");
             }
             // активный шприц в буфере платы
