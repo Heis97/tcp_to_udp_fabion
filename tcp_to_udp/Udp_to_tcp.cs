@@ -128,8 +128,8 @@ namespace tcp_to_udp
 
 
             _TCPserver1 = new TCPserver(62000);
-            //server_thread1 = new Thread(_TCPserver1.startServer);
-           // server_thread1.Start();
+            server_thread1 = new Thread(_TCPserver1.startServer);
+            server_thread1.Start();
 
             /*var coms_str = StepperFrame.test();
             for (int i = 0; i < coms_str.Length; i++)
