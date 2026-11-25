@@ -352,6 +352,7 @@ namespace tcp_to_udp
                 if (z_en == 1) printer.offset_zero_pos[printer.tool_active].p_xyz.z = cur_fr.p_xyz.z - z;
 
                 printer.tool_calibrated_manual[printer.tool_active] = true;
+                printer.offset_frame = printer.comp_offset(printer.cur_coordinate_system);
 
             }
             else if (command.Contains("M614"))//settings load
@@ -743,7 +744,7 @@ namespace tcp_to_udp
 
                     //Console.WriteLine(DateTime.Now.Ticks);
                     var mes = Encoding.ASCII.GetString(res);
-                    //Console.WriteLine("res1: " + mes);
+                  //Console.WriteLine("res1: " + mes);
                     if (res != null)
                     {
                         if (_TCPserver1.connected)
