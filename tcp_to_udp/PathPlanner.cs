@@ -2365,13 +2365,17 @@ namespace tcp_to_udp
                 }
                 else if (letter == 'M' && (code == 140 || code == 190 || code == 104 || code == 109))
                 {
-                    // Нагрев/охлаждение — на Octopus (M579), подробная логика будет позже.
-                    // M104/M109 T<шприц> — шприц, M140/M190 — стол. Ожидание — M109/M190.
+                    // Fabion: температура на Octopus.
+                    //   M104/M109 S<°C> — шприц (Пельтье, 5–37 °C) -> num1 M579 T<°C> E<1/0>
+                    //   M140/M190 S<°C> — стол (нагреватель PA1, Marlin) -> num1 M140 S<°C>
+                    //   S0 — выключить. M109/M190 ждут, пока плата снимет флаг «ожидание температуры».
                     var temp_dest = get(args, 'S');
+                    var t_str = temp_dest.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     int wait = (code == 190 || code == 109) ? 1 : 0;
-                    var heater = (code == 104 || code == 109) ? 1 + (int)get(args, 'T', tool_active) : 0;
-                    // S0 — выключить. Канал: N0 стол, N1..N3 шприцы
-                    coms.Add(new StepperFrame(1, 579, "N" + heater + " E" + (temp_dest != 0 ? 1 : 0) + " T" + temp_dest.ToString(System.Globalization.CultureInfo.InvariantCulture), false, wait));
+                    if (code == 104 || code == 109)
+                        coms.Add(new StepperFrame(1, 579, "T" + t_str + " E" + (temp_dest != 0 ? 1 : 0), false, wait));
+                    else
+                        coms.Add(new StepperFrame(1, 140, "S" + t_str, false, wait));
                 }
                 else
                 {
@@ -3443,7 +3447,7 @@ namespace tcp_to_udp
             {
                 consider_wait_en = wait;
             }
-            if (com_num == 579)
+            if (com_num == 579 || com_num == 140)   // Fabion: M140 — стол
             {
                 consider_wait_term = wait;
             }
